@@ -352,8 +352,23 @@ class TreePackingEnvironment(gym.Env):
         # Fill ratio bonusu (0 to 1.0 range)
         reward += self.fill_ratio * 1.0
 
-        # FIX: Compactness metriği KALDIRILDI - fill_ratio zaten bu bilgiyi veriyor
-        # Gereksiz complexity ve yanlış implementation yüzünden kaldırıldı
+        # Compactness bonusu: pair rotated rectangles union alanı
+        # Küçük union = kompakt yerleşim = yüksek bonus
+        if len(self.placed_trees) >= 2:
+            try:
+                rects_union = self.union_of_min_rotated_rectangles
+                if rects_union is not None and not rects_union.is_empty:
+                    rects_union_area = rects_union.area
+
+                    if new_bbox_area > 0:
+                        # Compactness ratio: küçük = iyi (ağaçlar birbirine yakın)
+                        compactness = rects_union_area / new_bbox_area
+                        # Küçük compactness → yüksek bonus
+                        compactness_bonus = max(0, 1.0 - compactness) * 1.0
+                        reward += compactness_bonus
+            except Exception:
+                # Shapely topology hatası - bu bonusu atla
+                pass
 
         # FIX: Episode sonu bonusu - normalized ve dengeli ölçek
         if self.current_index >= self.n_trees:

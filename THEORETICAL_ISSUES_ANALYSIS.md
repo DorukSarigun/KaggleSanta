@@ -66,57 +66,57 @@ avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.pl
 
 ---
 
-### 1.3 Compactness Bonus Mantık Hatası ❌ KRİTİK
+### 1.3 Compactness Bonus Ölçeklendirmesi ⚠️ ORTA (DÜZELTME: İMPLEMENTASYON DOĞRUYMUŞ)
 
 **Konum**: `environment.py:362-366`
 
-**Sorun**:
+**Eski Kod**:
 ```python
 compactness = rects_union_area / new_bbox_area
 compactness_bonus = max(0, 1.0 - compactness) * 2.0
 ```
 
-**Neden Yanlış**:
-- `compactness = union_area / bbox_area` büyükse → ağaçlar bbox'ı iyi dolduruyor (İYİ!)
-- Ama `1.0 - compactness` küçük oluyor → bonus düşük!
-- **Ters mantık**: Yüksek compactness düşük bonus veriyor
+**Analiz** (İlk analizim yanlışmış!):
+- `rects_union_area`: Her ağaç-komşu çifti için min rotated rectangle'ların union'ı
+- Küçük union = ağaçlar kompakt yerleştirilmiş = **İYİ!** ✓
+- Büyük union = ağaçlar dağınık = **KÖTÜ!** ✗
 
-**Anlamsal Sorun**:
-- "union of min rotated rectangles" zaten bbox_area'dan küçük veya eşit
-- Bu metrik aslında ne ölçüyor? Pair-wise rectangle'ların birleşimi
-- Daha anlamlı metrik: fill_ratio = total_tree_area / bbox_area
+**Doğru Mantık**:
+- `compactness = union / bbox` → Küçükse iyi (0.3 = iyi)
+- `bonus = (1 - compactness) * 2.0` → Küçük compactness = yüksek bonus ✓
+- **Eski implementasyon DOĞRUYMUŞ!**
 
-**Doğru Çözüm**:
+**Yapılan İyileştirme**:
+- Sadece weight'i 2.0'dan 1.0'a düşürdüm (diğer bonuslarla dengeli olsun)
 ```python
-# Compactness yüksekse bonus VER, düşükse ceza
-# Ama zaten fill_ratio var (line 351), bu metrik gereksiz!
-# KALDIR veya doğru uygula:
-if compactness > 0:
-    compactness_bonus = compactness * 2.0  # Yüksek = iyi
-    reward += compactness_bonus
+compactness_bonus = max(0, 1.0 - compactness) * 1.0  # Balanced weight
 ```
 
 ---
 
 ### 1.4 Reward Ölçek Dengesizliği ⚠️ ORTA
 
-**Sorun**:
+**Eski Sorun**:
 - Collision penalty: -10 * normalized_area (could be -100+)
 - No growth bonus: +2.0
 - Growth penalty: -5.0 * expansion_ratio (could be -50+)
 - Fill ratio bonus: +0.5 * fill_ratio (max +0.5)
+- Compactness bonus: +2.0 * (1 - compactness) (max +2.0)
 - Final bonus: ~1e13 veya ~0.01 (belirsiz)
 
 **Sonuç**: Agent reward signal'larda kaybolur, öğrenemez
 
-**Doğru Çözüm**:
+**Yeni Dengeli Reward Scale**:
 ```python
-# Tüm reward bileşenlerini [-5, +5] arasına normalize et
-# Collision: -5.0 (çok kötü)
+# Tüm reward bileşenleri [-5, +5] arasına normalize edildi
+# Collision: min(-10 * normalized, -5.0) → max penalty -5.0
 # Good placement: +2.0
-# Growth: -3.0 * normalized (max -3.0)
-# Fill: +1.0 * fill_ratio (max +1.0)
-# Final: -log(bbox_normalized) (tipik range: -5 to +5)
+# Growth penalty: min(-5.0 * expansion, -3.0) → max penalty -3.0
+# Fill ratio: +1.0 * fill_ratio → max +1.0
+# Compactness: +1.0 * (1 - compactness) → max +1.0
+# Final: -log(bbox_normalized) → tipik range: -5 to +5
+
+# Total step reward tipik range: -5 to +5 (dengeli!)
 ```
 
 ---
@@ -377,7 +377,7 @@ scheduler = StepLR(optimizer, step_size=100, gamma=0.9)
 
 ### KRİTİK (Hemen Düzelt):
 1. ✅ Episode final bonus ölçeklendirmesi (1.1)
-2. ✅ Compactness bonus mantık hatası (1.3)
+2. ✅ Compactness bonus ölçeklendirmesi - weight düzeltmesi (1.3)
 3. ✅ State-independent exploration (2.2)
 
 ### ORTA (Yakında Düzelt):
@@ -408,10 +408,20 @@ avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.pl
 normalized_expansion = area_expansion / old_bbox_area
 reward -= min(normalized_expansion * 5.0, 3.0)  # Cap at -3.0
 
-# Line 365: Compactness'i KALDIR (fill_ratio zaten var)
-# compactness bonus kısmını sil
+# Line 355-371: Compactness bonus weight'i düzelt ve geri ekle
+if len(self.placed_trees) >= 2:
+    try:
+        rects_union = self.union_of_min_rotated_rectangles
+        if rects_union is not None and not rects_union.is_empty:
+            rects_union_area = rects_union.area
+            if new_bbox_area > 0:
+                compactness = rects_union_area / new_bbox_area
+                compactness_bonus = max(0, 1.0 - compactness) * 1.0  # Weight: 2.0 → 1.0
+                reward += compactness_bonus
+    except Exception:
+        pass
 
-# Line 372-376: Final bonus düzelt
+# Line 373-378: Final bonus düzelt
 if self.current_index >= self.n_trees:
     bbox_size_normalized = np.sqrt(new_bbox_area) / float(scale_factor)
     if bbox_size_normalized > 0:
@@ -478,11 +488,12 @@ else:
 ## 6. BEKLENEN İYİLEŞTİRMELER
 
 Bu düzeltmelerden sonra:
-- ✅ Reward signal daha stabil ve balanced
-- ✅ Network daha iyi exploration yapabilir
-- ✅ Training daha stabil ve hızlı converge eder
-- ✅ Final bbox size daha küçük (daha iyi packing)
-- ✅ Gradient flow daha sağlıklı
+- ✅ Reward signal daha stabil ve balanced (tüm bileşenler -5 to +5 range)
+- ✅ Compactness metriği geri eklendi (doğru weight ile: 1.0)
+- ✅ Network daha iyi exploration yapabilir (state-dependent std)
+- ✅ Training daha stabil ve hızlı converge eder (Pre-LN transformer)
+- ✅ Final bbox size daha küçük (daha iyi packing, compactness reward sayesinde)
+- ✅ Gradient flow daha sağlıklı (norm_first=True)
 
 ---
 
