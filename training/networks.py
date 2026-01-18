@@ -77,18 +77,20 @@ class TransformerStateEncoder(nn.Module):
     Output: Global state representation (batch, state_dim)
     """
     
-    def __init__(self, embed_dim: int = 128, n_heads: int = 4, n_layers: int = 2, 
+    def __init__(self, embed_dim: int = 128, n_heads: int = 4, n_layers: int = 2,
                  state_dim: int = 256, dropout: float = 0.1):
         super().__init__()
-        
+
         # No positional encoding - tree order doesn't matter
-        
+
+        # FIX: norm_first=True for better gradient flow and training stability
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
             dim_feedforward=embed_dim * 4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True  # Pre-LN: daha stabil training
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
@@ -151,24 +153,25 @@ class ScalarEncoder(nn.Module):
 class Actor(nn.Module):
     """
     Policy network - outputs action distribution parameters.
-    
+
     Action: (x, y, rotation) continuous
     Output: mean and std for Gaussian distribution
     """
-    
+
     def __init__(self, state_dim: int = 288, action_dim: int = 3, hidden_dim: int = 128):
         super().__init__()
-        
+
         self.mlp = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
-        
+
         self.mean_head = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))  # Learnable log std
-    
+        # FIX: State-dependent log_std for adaptive exploration
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -179,8 +182,10 @@ class Actor(nn.Module):
         """
         features = self.mlp(state)
         mean = self.mean_head(features)
-        log_std = self.log_std.expand_as(mean)
-        
+        # FIX: State-dependent std with stability clipping
+        log_std = self.log_std_head(features)
+        log_std = torch.clamp(log_std, min=-20, max=2)  # Prevent explosion/vanishing
+
         return mean, log_std
 
 

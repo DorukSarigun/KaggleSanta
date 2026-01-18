@@ -310,29 +310,31 @@ class TreePackingEnvironment(gym.Env):
         
         return total_intersection_area
 
-    def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float, 
+    def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        Reward fonksiyonu (alan bazlı).
-        
+        Reward fonksiyonu (alan bazlı) - İyileştirilmiş versiyon.
+
         Args:
             old_bbox_area: Önceki bounding box ALANI
             new_bbox_area: Yeni bounding box ALANI
             collision_area: Çarpışma alanı (0 = çarpışma yok)
-            
+
         Returns:
             Reward değeri
         """
         reward = 0.0
-        
+
         # Çarpışma varsa alana orantılı ceza
         if collision_area > 0:
-            # Normalize: çarpışma alanı / ortalama ağaç alanı
-            avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.placed_trees else 1e28
+            # FIX: Sabit referans alan kullan (tek ağaç alanı ~0.5 * 1e15^2)
+            single_tree_area = 5e29  # Yaklaşık bir ağaç alanı
+            avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.placed_trees else single_tree_area
             normalized_collision = collision_area / avg_tree_area
-            reward -= normalized_collision * 10.0
+            # Cap collision penalty at -5.0 for stability
+            reward -= min(normalized_collision * 10.0, 5.0)
             return reward  # Çarpışmada erken dön
-        
+
         # Bbox ALAN büyümesine göre ceza/ödül
         if old_bbox_area == 0:
             # İlk ağaç
@@ -343,38 +345,27 @@ class TreePackingEnvironment(gym.Env):
                 # Kutu büyümedi veya küçüldü → bonus
                 reward += 2.0
             else:
-                # Kutu büyüdü → expansion'a orantılı ceza
+                # FIX: Kutu büyüdü → expansion'a orantılı ceza (max -3.0)
                 normalized_expansion = area_expansion / old_bbox_area
-                reward -= normalized_expansion * 5.0
-        
-        # Fill ratio bonusu
-        reward += self.fill_ratio * 0.5
-        
-        # Pairwise rotated rectangles union alanı bonusu
-        # Daha küçük birleşim alanı = daha kompakt paketleme
-        if len(self.placed_trees) >= 2:
-            try:
-                rects_union = self.union_of_min_rotated_rectangles
-                if rects_union is not None and not rects_union.is_empty:
-                    rects_union_area = rects_union.area
-                    
-                    if new_bbox_area > 0:
-                        # Kompaktlık oranı: rect_union / bbox (küçük = iyi)
-                        compactness = rects_union_area / new_bbox_area
-                        # Ters orantılı bonus (kompakt ise yüksek)
-                        compactness_bonus = max(0, 1.0 - compactness) * 2.0
-                        reward += compactness_bonus
-            except Exception:
-                # Shapely topology hatası - bu bonusu atla
-                pass
-        
-        # Episode sonu bonusu
+                reward -= min(normalized_expansion * 5.0, 3.0)
+
+        # Fill ratio bonusu (0 to 1.0 range)
+        reward += self.fill_ratio * 1.0
+
+        # FIX: Compactness metriği KALDIRILDI - fill_ratio zaten bu bilgiyi veriyor
+        # Gereksiz complexity ve yanlış implementation yüzünden kaldırıldı
+
+        # FIX: Episode sonu bonusu - normalized ve dengeli ölçek
         if self.current_index >= self.n_trees:
-            # Yarışma skoru: 1 / bbox_size → 1 / sqrt(bbox_area)
-            bbox_size = np.sqrt(new_bbox_area) if new_bbox_area > 0 else 1
-            final_score = 1e15 / bbox_size if bbox_size > 0 else 0
-            reward += final_score * 0.01
-        
+            # Yarışma skoru: 1 / bbox_size (küçük bbox = yüksek skor)
+            # Logaritmik ölçeğe çevir ki step rewards ile uyumlu olsun
+            bbox_size_normalized = np.sqrt(new_bbox_area) / float(scale_factor)
+            if bbox_size_normalized > 0:
+                # Log reward: küçük bbox = pozitif, büyük bbox = negatif
+                # Tipik range: -5 to +5 (step rewards ile uyumlu)
+                final_bonus = -np.log(bbox_size_normalized + 1e-6)
+                reward += final_bonus * 1.0
+
         return reward
 
     def _update_strtree(self):

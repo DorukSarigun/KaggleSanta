@@ -44,28 +44,30 @@ class RolloutBuffer:
         self.log_probs.clear()
         self.dones.clear()
     
-    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99, 
+    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99,
                                         gae_lambda: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
         """GAE ile returns ve advantages hesaplar."""
         rewards = np.array(self.rewards)
         values = np.array(self.values)
         dones = np.array(self.dones)
-        
+
         n_steps = len(rewards)
         advantages = np.zeros(n_steps)
         last_gae = 0
-        
+
         for t in reversed(range(n_steps)):
             if t == n_steps - 1:
                 next_value = last_value
-                next_done = 0
+                # FIX: Use current step's done flag, not 0
+                next_done = dones[t]
             else:
                 next_value = values[t + 1]
-                next_done = dones[t + 1]
-            
+                # FIX: Use current step's done flag
+                next_done = dones[t]
+
             delta = rewards[t] + gamma * next_value * (1 - next_done) - values[t]
             advantages[t] = last_gae = delta + gamma * gae_lambda * (1 - next_done) * last_gae
-        
+
         returns = advantages + values
         return returns, advantages
     
@@ -191,14 +193,14 @@ class LiveVisualizer:
 class PPOTrainer:
     """PPO trainer with live visualization."""
     
-    def __init__(self, 
+    def __init__(self,
                  n_trees: int = 10,
                  max_trees: int = 200,
                  lr: float = 3e-4,
                  gamma: float = 0.99,
                  gae_lambda: float = 0.95,
                  clip_epsilon: float = 0.2,
-                 entropy_coef: float = 0.01,
+                 entropy_coef: float = 0.05,  # FIX: Increased for better exploration
                  value_coef: float = 0.5,
                  max_grad_norm: float = 0.5,
                  n_epochs: int = 4,
@@ -323,17 +325,23 @@ class PPOTrainer:
         for episode in range(n_episodes):
             # Collect rollouts
             episode_reward, bbox_size = self.collect_rollouts(self.n_trees)
-            
-            # Compute returns and advantages
+
+            # FIX: Compute last_value correctly based on terminal state
             with torch.no_grad():
-                obs = self.env.get_observation()
-                obs_tensor = {
-                    key: torch.tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    for key, value in obs.items()
-                }
-                _, _, last_value = self.network.forward(obs_tensor)
-                last_value = last_value.item() if not self.env.current_index >= self.n_trees else 0
-            
+                # Check if last step was terminal
+                if len(self.buffer.dones) > 0 and self.buffer.dones[-1]:
+                    # Episode ended, terminal state has value 0
+                    last_value = 0.0
+                else:
+                    # Episode not done, estimate value of next state
+                    obs = self.env.get_observation()
+                    obs_tensor = {
+                        key: torch.tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
+                        for key, value in obs.items()
+                    }
+                    _, _, last_value_tensor = self.network.forward(obs_tensor)
+                    last_value = last_value_tensor.item()
+
             returns, advantages = self.buffer.compute_returns_and_advantages(
                 last_value, self.gamma, self.gae_lambda
             )
