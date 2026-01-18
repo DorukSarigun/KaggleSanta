@@ -205,9 +205,9 @@ class PPOTrainer:
                  max_grad_norm: float = 0.5,
                  n_epochs: int = 4,
                  batch_size: int = 64,
-                 device: str = 'cpu',
+                 device: str = None,  # Auto-detect GPU if available
                  visualize: bool = True):
-        
+
         self.n_trees = n_trees
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -217,13 +217,27 @@ class PPOTrainer:
         self.max_grad_norm = max_grad_norm
         self.n_epochs = n_epochs
         self.batch_size = batch_size
-        self.device = device
-        
+
+        # Auto-detect device (CUDA GPU if available, else CPU)
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        # Enable cuDNN benchmarking for better GPU performance
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+        print(f"Using device: {self.device}")
+        if self.device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+
         # Environment
         self.env = TreePackingEnvironment(n_trees=n_trees, max_trees=max_trees)
-        
+
         # Network
-        self.network = create_network({"max_trees": max_trees}).to(device)
+        self.network = create_network({"max_trees": max_trees}).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr)
         
         # Buffer
@@ -378,10 +392,10 @@ class PPOTrainer:
     
     def load(self, path: str):
         """Model yükle."""
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['network_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f"Model loaded from {path}")
+        print(f"Model loaded from {path} to {self.device}")
 
 
 if __name__ == "__main__":
@@ -390,7 +404,8 @@ if __name__ == "__main__":
         lr=3e-4,
         n_epochs=4,
         batch_size=32,
+        device=None,         # Auto-detect GPU (cuda if available, else cpu)
         visualize=True       # Canlı görselleştirme
     )
-    
+
     trainer.train(n_episodes=100)
