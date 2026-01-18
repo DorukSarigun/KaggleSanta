@@ -44,28 +44,30 @@ class RolloutBuffer:
         self.log_probs.clear()
         self.dones.clear()
     
-    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99, 
+    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99,
                                         gae_lambda: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
         """GAE ile returns ve advantages hesaplar."""
         rewards = np.array(self.rewards)
         values = np.array(self.values)
         dones = np.array(self.dones)
-        
+
         n_steps = len(rewards)
         advantages = np.zeros(n_steps)
         last_gae = 0
-        
+
         for t in reversed(range(n_steps)):
             if t == n_steps - 1:
                 next_value = last_value
-                next_done = 0
+                # FIX: Use current step's done flag, not 0
+                next_done = dones[t]
             else:
                 next_value = values[t + 1]
-                next_done = dones[t + 1]
-            
+                # FIX: Use current step's done flag
+                next_done = dones[t]
+
             delta = rewards[t] + gamma * next_value * (1 - next_done) - values[t]
             advantages[t] = last_gae = delta + gamma * gae_lambda * (1 - next_done) * last_gae
-        
+
         returns = advantages + values
         return returns, advantages
     
@@ -191,21 +193,21 @@ class LiveVisualizer:
 class PPOTrainer:
     """PPO trainer with live visualization."""
     
-    def __init__(self, 
+    def __init__(self,
                  n_trees: int = 10,
                  max_trees: int = 200,
                  lr: float = 3e-4,
                  gamma: float = 0.99,
                  gae_lambda: float = 0.95,
                  clip_epsilon: float = 0.2,
-                 entropy_coef: float = 0.01,
+                 entropy_coef: float = 0.05,  # FIX: Increased for better exploration
                  value_coef: float = 0.5,
                  max_grad_norm: float = 0.5,
                  n_epochs: int = 4,
                  batch_size: int = 64,
-                 device: str = 'cpu',
+                 device: str = None,  # Auto-detect GPU if available
                  visualize: bool = True):
-        
+
         self.n_trees = n_trees
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -215,13 +217,27 @@ class PPOTrainer:
         self.max_grad_norm = max_grad_norm
         self.n_epochs = n_epochs
         self.batch_size = batch_size
-        self.device = device
-        
+
+        # Auto-detect device (CUDA GPU if available, else CPU)
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        # Enable cuDNN benchmarking for better GPU performance
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+        print(f"Using device: {self.device}")
+        if self.device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+
         # Environment
         self.env = TreePackingEnvironment(n_trees=n_trees, max_trees=max_trees)
-        
+
         # Network
-        self.network = create_network({"max_trees": max_trees}).to(device)
+        self.network = create_network({"max_trees": max_trees}).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr)
         
         # Buffer
@@ -323,17 +339,23 @@ class PPOTrainer:
         for episode in range(n_episodes):
             # Collect rollouts
             episode_reward, bbox_size = self.collect_rollouts(self.n_trees)
-            
-            # Compute returns and advantages
+
+            # FIX: Compute last_value correctly based on terminal state
             with torch.no_grad():
-                obs = self.env.get_observation()
-                obs_tensor = {
-                    key: torch.tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    for key, value in obs.items()
-                }
-                _, _, last_value = self.network.forward(obs_tensor)
-                last_value = last_value.item() if not self.env.current_index >= self.n_trees else 0
-            
+                # Check if last step was terminal
+                if len(self.buffer.dones) > 0 and self.buffer.dones[-1]:
+                    # Episode ended, terminal state has value 0
+                    last_value = 0.0
+                else:
+                    # Episode not done, estimate value of next state
+                    obs = self.env.get_observation()
+                    obs_tensor = {
+                        key: torch.tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
+                        for key, value in obs.items()
+                    }
+                    _, _, last_value_tensor = self.network.forward(obs_tensor)
+                    last_value = last_value_tensor.item()
+
             returns, advantages = self.buffer.compute_returns_and_advantages(
                 last_value, self.gamma, self.gae_lambda
             )
@@ -370,10 +392,10 @@ class PPOTrainer:
     
     def load(self, path: str):
         """Model yükle."""
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['network_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f"Model loaded from {path}")
+        print(f"Model loaded from {path} to {self.device}")
 
 
 if __name__ == "__main__":
@@ -382,7 +404,8 @@ if __name__ == "__main__":
         lr=3e-4,
         n_epochs=4,
         batch_size=32,
+        device=None,         # Auto-detect GPU (cuda if available, else cpu)
         visualize=True       # Canlı görselleştirme
     )
-    
+
     trainer.train(n_episodes=100)
