@@ -114,10 +114,46 @@ compactness_bonus = max(0, 1.0 - compactness) * 1.0  # Balanced weight
 # Growth penalty: min(-5.0 * expansion, -3.0) → max penalty -3.0
 # Fill ratio: +1.0 * fill_ratio → max +1.0
 # Compactness: +1.0 * (1 - compactness) → max +1.0
+# Centroid stability: +0.5 * (1 - shift) → max +0.5 (NEW!)
 # Final: -log(bbox_normalized) → tipik range: -5 to +5
 
-# Total step reward tipik range: -5 to +5 (dengeli!)
+# Total step reward tipik range: -5 to +6.5 (dengeli!)
 ```
+
+### 1.5 Centroid Shift Metriği ✅ YENİ İYİLEŞTİRME
+
+**Amaç**: Yeni ağaç eklendiğinde, mevcut ağaç kümesinin merkezinin ne kadar kaydığını ölçmek.
+
+**Mantık**:
+- Pairwise rectangles union'ının centroid'ini hesapla
+- Her adımda centroid kaymasını ölç
+- Küçük kayma = yeni ağaç mevcut kümeye yakın = **İYİ!** ✓
+- Büyük kayma = yeni ağaç uzağa eklendi = **KÖTÜ!** ✗
+
+**Implementasyon**:
+```python
+# Her adımda union centroid'i hesapla
+current_centroid = rects_union.centroid
+
+if prev_centroid is not None:
+    # Centroid shift distance
+    shift_distance = prev_centroid.distance(current_centroid)
+
+    # Normalize by bbox size
+    normalized_shift = shift_distance / bbox_size
+
+    # Small shift = high bonus
+    centroid_bonus = max(0, 1.0 - normalized_shift) * 0.5
+    reward += centroid_bonus
+
+# Update for next step
+prev_centroid = current_centroid
+```
+
+**Neden Önemli?**:
+- Bu metrik **lokal kompaktlık** ölçüyor
+- Compactness metriği global alan ölçerken, centroid shift lokal stabiliteyi ölçüyor
+- İki metrik birlikte: hem kompakt hem lokal yerleşimi teşvik ediyor
 
 ---
 
@@ -388,11 +424,14 @@ scheduler = StepLR(optimizer, step_size=100, gamma=0.9)
 8. ✅ Last value computation (3.2)
 9. ✅ Entropy coefficient (3.4)
 
+### YENİ İYİLEŞTİRMELER:
+10. ✅ Centroid shift metriği eklendi (1.5) - Lokal kompaktlık ödülü
+
 ### DÜŞÜK (İyileştirme):
-10. Tanh squashing bias (2.3) - Standart pratik
-11. Transformer efficiency (2.4) - Performans optimizasyonu
-12. Batch size (3.3) - Hiperparametre tuning
-13. LR scheduling (3.5) - Nice to have
+11. Tanh squashing bias (2.3) - Standart pratik
+12. Transformer efficiency (2.4) - Performans optimizasyonu
+13. Batch size (3.3) - Hiperparametre tuning
+14. LR scheduling (3.5) - Nice to have
 
 ---
 
@@ -400,6 +439,12 @@ scheduler = StepLR(optimizer, step_size=100, gamma=0.9)
 
 ### `environment.py`:
 ```python
+# Line 96: __init__ - Add centroid tracking
+self.prev_union_centroid = None  # Track centroid of pairwise rectangles union
+
+# Line 163: reset() - Reset centroid
+self.prev_union_centroid = None
+
 # Line 331: Collision normalization
 single_tree_area = 5e29
 avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.placed_trees else single_tree_area
@@ -408,16 +453,30 @@ avg_tree_area = self.total_tree_area / max(1, len(self.placed_trees)) if self.pl
 normalized_expansion = area_expansion / old_bbox_area
 reward -= min(normalized_expansion * 5.0, 3.0)  # Cap at -3.0
 
-# Line 355-371: Compactness bonus weight'i düzelt ve geri ekle
+# Line 357-392: Compactness ve centroid shift bonusları
 if len(self.placed_trees) >= 2:
     try:
         rects_union = self.union_of_min_rotated_rectangles
         if rects_union is not None and not rects_union.is_empty:
             rects_union_area = rects_union.area
+
+            # Compactness bonus
             if new_bbox_area > 0:
                 compactness = rects_union_area / new_bbox_area
                 compactness_bonus = max(0, 1.0 - compactness) * 1.0  # Weight: 2.0 → 1.0
                 reward += compactness_bonus
+
+            # Centroid shift bonus (NEW!)
+            current_centroid = rects_union.centroid
+            if self.prev_union_centroid is not None and current_centroid is not None:
+                shift_distance = self.prev_union_centroid.distance(current_centroid)
+                bbox_size = np.sqrt(new_bbox_area) if new_bbox_area > 0 else 1.0
+                normalized_shift = shift_distance / bbox_size
+                centroid_stability_bonus = max(0, 1.0 - normalized_shift) * 0.5
+                reward += centroid_stability_bonus
+
+            # Update for next step
+            self.prev_union_centroid = current_centroid
     except Exception:
         pass
 
@@ -488,11 +547,13 @@ else:
 ## 6. BEKLENEN İYİLEŞTİRMELER
 
 Bu düzeltmelerden sonra:
-- ✅ Reward signal daha stabil ve balanced (tüm bileşenler -5 to +5 range)
+- ✅ Reward signal daha stabil ve balanced (tüm bileşenler -5 to +6.5 range)
 - ✅ Compactness metriği geri eklendi (doğru weight ile: 1.0)
+- ✅ **Centroid shift metriği eklendi** (lokal stabilite ödülü: 0.5)
 - ✅ Network daha iyi exploration yapabilir (state-dependent std)
 - ✅ Training daha stabil ve hızlı converge eder (Pre-LN transformer)
-- ✅ Final bbox size daha küçük (daha iyi packing, compactness reward sayesinde)
+- ✅ Final bbox size daha küçük (compactness + centroid rewards sayesinde)
+- ✅ **Lokal küme oluşumu** (centroid shift, ağaçları mevcut kümeye yakın eklemeye teşvik ediyor)
 - ✅ Gradient flow daha sağlıklı (norm_first=True)
 
 ---

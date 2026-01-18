@@ -89,10 +89,11 @@ class TreePackingEnvironment(gym.Env):
         self.n_trees = n_trees
         self.max_trees = max_trees
         self.seed = seed
-        
+
         self.placed_trees: List[ChristmasTree] = []
         self.current_index = 0
         self._strtree: Optional[STRtree] = None
+        self.prev_union_centroid = None  # Track centroid of pairwise rectangles union
         
         # Action Space: (x, y, rotation) continuous
         self.action_space = spaces.Box(
@@ -149,16 +150,17 @@ class TreePackingEnvironment(gym.Env):
     def reset(self, seed=None, options=None) -> Tuple[Dict, Dict]:
         """
         Environment'ı sıfırlar.
-        
+
         Returns:
             observation: İlk state dictionary
             info: Ek bilgiler
         """
         super().reset(seed=seed)
-        
+
         self.placed_trees = []
         self.current_index = 0
         self._strtree = None
+        self.prev_union_centroid = None
         
         observation = self.get_observation()
         info = {
@@ -366,6 +368,25 @@ class TreePackingEnvironment(gym.Env):
                         # Küçük compactness → yüksek bonus
                         compactness_bonus = max(0, 1.0 - compactness) * 1.0
                         reward += compactness_bonus
+
+                    # Centroid shift bonus: merkez stabilitesi
+                    # Küçük kayma = yeni ağaç mevcut kümeye yakın eklendi = iyi
+                    current_centroid = rects_union.centroid
+                    if self.prev_union_centroid is not None and current_centroid is not None:
+                        # Centroid arası mesafe (scale_factor ile normalize edilmiş)
+                        shift_distance = self.prev_union_centroid.distance(current_centroid)
+
+                        # Bbox size'a göre normalize et (oransal kayma)
+                        bbox_size = np.sqrt(new_bbox_area) if new_bbox_area > 0 else 1.0
+                        normalized_shift = shift_distance / bbox_size
+
+                        # Küçük kayma = yüksek bonus, büyük kayma = düşük bonus
+                        # normalized_shift tipik range: 0 (hiç kaymamış) to 1+ (çok kaymış)
+                        centroid_stability_bonus = max(0, 1.0 - normalized_shift) * 0.5
+                        reward += centroid_stability_bonus
+
+                    # Update prev_centroid for next step
+                    self.prev_union_centroid = current_centroid
             except Exception:
                 # Shapely topology hatası - bu bonusu atla
                 pass
