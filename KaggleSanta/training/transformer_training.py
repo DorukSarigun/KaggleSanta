@@ -378,9 +378,12 @@ class TransformerTrainer:
                 entropy_loss = -entropy.mean()
 
                 # Collision prediction loss (NEW! - auxiliary task)
-                collision_loss = nn.functional.binary_cross_entropy(
-                    collision_probs.squeeze(-1),
-                    batch["collision_labels"],
+                # Use BCEWithLogits for numerical stability (no sigmoid needed on network output)
+                # Also clamp labels to [0,1] in case of NaN
+                collision_labels_safe = torch.clamp(batch["collision_labels"], 0.0, 1.0)
+                collision_loss = nn.functional.binary_cross_entropy_with_logits(
+                    collision_probs.squeeze(-1),  # raw logits, no sigmoid
+                    collision_labels_safe,
                     reduction='mean'
                 )
 

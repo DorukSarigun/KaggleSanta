@@ -176,6 +176,7 @@ class TreePackingEnvironment(gym.Env):
         self.prev_union_centroid = None
         self.collision_history = []
         self.last_collision_area = 0.0
+        self.collision_count = 0  # Track total collisions for episode
         
         observation = self.get_observation()
         info = {
@@ -233,6 +234,9 @@ class TreePackingEnvironment(gym.Env):
             self.placed_trees.append(new_tree)
             self.current_index += 1
             self._update_strtree()
+        else:
+            # Collision oldu - sayacı artır
+            self.collision_count += 1
         
         # Yeni bbox ALANI
         new_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
@@ -240,18 +244,20 @@ class TreePackingEnvironment(gym.Env):
         # Reward hesapla (alan bazlı)
         reward = self._calculate_reward(old_bbox_area, new_bbox_area, collision_area)
         
-        # Episode bitti mi? (Collision olursa da biter!)
-        terminated = self.current_index >= self.n_trees or has_collision
+        # Episode bitti mi? (3 collision VEYA tüm ağaçlar yerleşti)
+        max_collisions = 3
+        terminated = self.current_index >= self.n_trees or self.collision_count >= max_collisions
         truncated = False
         
         # Observation
         observation = self.get_observation()
         
-        # Info
+        # Info (bbox_size normalized for display)
+        norm = float(scale_factor)
         info = {
             "n_placed": len(self.placed_trees),
             "n_remaining": self.n_trees - self.current_index,
-            "bbox_size": self.bounding_box_size,
+            "bbox_size": self.bounding_box_size / norm,  # Normalized to [0, 10]
             "bbox_area": new_bbox_area,
             "fill_ratio": self.fill_ratio,
             "collision": has_collision,
@@ -551,31 +557,11 @@ class TreePackingEnvironment(gym.Env):
             # This allows learning from near-collisions
             return collision_penalty
 
-        # ==================== 2. NEAR-COLLISION WARNING (SOFT PENALTY) ====================
-        # Check if placement is risky (very close to existing trees)
-        near_collision_penalty = 0.0
-        if n_placed >= 1:
-            # Get minimum distance to any existing tree
-            last_tree = self.placed_trees[-1] if not collision_area > 0 else None
-            if last_tree is not None:
-                min_distance = float('inf')
-                for tree in self.placed_trees[:-1]:
-                    dist = last_tree.polygon.distance(tree.polygon)
-                    min_distance = min(min_distance, dist)
+        # NEAR-COLLISION PENALTY REMOVED - unnecessary complexity
 
-                # Normalize distance
-                norm = float(scale_factor)
-                normalized_dist = min_distance / norm
-
-                # Soft penalty for distances < 0.5
-                if normalized_dist < 0.5:
-                    # Smoothly increase penalty as distance decreases
-                    # dist=0.5 -> penalty=0, dist=0.1 -> penalty=-2.0
-                    near_collision_penalty = -2.0 * (1.0 - normalized_dist / 0.5)
-
-        # ==================== 3. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
+        # ==================== 2. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
         # Her başarılı yerleşim = +1 bonus
-        reward = 1.0 + near_collision_penalty  # Base placement bonus + safety check
+        reward = 1.0  # Base placement bonus
 
         # Kaggle score = s² / n where s = max(width, height)
         # Lower is better -> improvement = old - new
@@ -595,23 +581,7 @@ class TreePackingEnvironment(gym.Env):
             # Amplify it to balance with placement bonus
             reward += kaggle_improvement * 10.0
 
-        # ==================== 4. DENSITY BONUS (Encourage tight packing) ====================
-        # Reward for placing trees close together (but not TOO close)
-        if n_placed >= 2 and collision_area == 0:
-            last_tree = self.placed_trees[-1]
-            min_distance = float('inf')
-            for tree in self.placed_trees[:-1]:
-                dist = last_tree.polygon.distance(tree.polygon)
-                min_distance = min(min_distance, dist)
-
-            norm = float(scale_factor)
-            normalized_dist = min_distance / norm
-
-            # Optimal distance: 0.3 - 0.7 (close but safe)
-            # Sweet spot bonus
-            if 0.3 <= normalized_dist <= 0.7:
-                density_bonus = 0.5 * (1.0 - abs(normalized_dist - 0.5) / 0.2)
-                reward += density_bonus
+        # DENSITY BONUS REMOVED - unnecessary complexity
 
         return reward
 

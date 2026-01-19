@@ -481,14 +481,14 @@ class TransformerActorCritic(nn.Module):
         )
 
         # Collision prediction head (NEW! - auxiliary task)
-        # Predicts probability of collision for current action
+        # Outputs raw logits - BCEWithLogits applies sigmoid internally
         self.collision_predictor = nn.Sequential(
             nn.Linear(state_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # Output probability [0, 1]
+            nn.Linear(64, 1)
+            # No sigmoid! BCEWithLogits handles it
         )
     
     def encode_trees(
