@@ -547,6 +547,105 @@ Bu kapsamli kod incelemesi, KaggleSanta projesinin guclu bir temel uzerine kurul
 
 ---
 
+## 10. COLLISION LEARNING IYILESTIRMELERI (v2)
+
+### 10.1 Tespit Edilen Collision Ogrenme Sorunlari
+
+| Problem | Aciklama | Onceki Durum |
+|---------|----------|--------------|
+| Zayif collision penalty | -1 max ceza cok dusuk | Agent collision'i onemsimiyor |
+| Observation'da collision bilgisi yok | Nereye koyarsa collision olacagini goremiyor | Kor ogrenme |
+| State degismiyor | current_index artmiyor | Sonsuz dongu riski |
+| Binary feedback | Sadece collision oldu/olmadi | Gradyan bilgisi yok |
+
+### 10.2 Gerceklestirilen Collision Iyilestirmeleri
+
+#### 1. Collision Penalty Guclendirme
+```python
+# ONCEKI: -1 max penalty
+collision_penalty = -overlap_ratio  # [-1, 0]
+
+# YENİ: -10 max penalty + consecutive penalty
+base_penalty = -5.0
+overlap_penalty = -3.0 * overlap_ratio  # [-3, 0]
+consecutive_penalty = -1.0 * consecutive_collisions  # [-5, 0]
+# TOPLAM: -5 to -13 (cap at -10)
+```
+
+#### 2. Collision Map Ekleme
+```python
+# observation_space'e yeni ekleme
+"collision_map": spaces.Box(0, 1, shape=(256, 256))
+
+# _get_collision_map() metodu
+- Mevcut agaclarin pozisyonlari = 1.0
+- Buffer bolgeleri (tehlikeli) = 0.5
+- Agent nereye koyamayacagini goruyor
+```
+
+#### 3. Collision Tracking
+```python
+# Environment'a yeni ozellikler
+self.consecutive_collisions = 0
+self.total_collisions = 0
+self.max_consecutive_collisions = 10
+self.last_collision_position = None
+
+# scalars genisletildi (5 -> 8 dim)
+- collision_streak (normalized)
+- collision_rate
+- had_collision_last_step
+```
+
+#### 4. Truncation Mekanizmasi
+```python
+# 10 ust uste collision = episode truncate
+truncated = consecutive_collisions >= max_consecutive_collisions
+```
+
+#### 5. CollisionMapEncoder Network Modulu
+```python
+class CollisionMapEncoder(nn.Module):
+    # 256x256 collision map -> 64 dim embedding
+    # CNN ile spatial collision bilgisi ogrenme
+```
+
+### 10.3 Reward Yapisi Karsilastirmasi
+
+| Bilesken | Onceki | Yeni |
+|----------|--------|------|
+| Collision penalty | -1 max | -10 max |
+| Consecutive collision | Yok | -1 per consecutive |
+| Placement bonus | +0.1 | +1.0 |
+| Collision-free streak | Yok | +0.2 * progress |
+| Final collision-free | Yok | +1.0 bonus |
+
+### 10.4 Observation Space Karsilastirmasi
+
+| Feature | Onceki | Yeni |
+|---------|--------|------|
+| scalars dim | 5 | 8 |
+| collision_map | Yok | (256, 256) |
+| collision tracking | Yok | 3 feature |
+
+### 10.5 Network Boyutu Karsilastirmasi
+
+| Metrik | Onceki | Yeni | Degisim |
+|--------|--------|------|---------|
+| Combined state dim | 384 | 448 | +64 |
+| CollisionMapEncoder | Yok | ~0.5M params | +0.5M |
+| Toplam parametre | ~4.2M | ~4.7M | +12% |
+
+### 10.6 Beklenen Collision Learning Iyilestirmeleri
+
+1. **Collision rate:** %30+ azalma bekleniyor
+2. **Ogrenme hizi:** 3x daha hizli collision kacinma
+3. **Episode completion:** Daha az truncation
+4. **Policy quality:** Collision-aware yerlesim stratejisi
+
+---
+
 **Rapor Sonu**
 
 *Bu rapor Claude Code tarafindan otomatik olarak olusturulmustur.*
+*Son guncelleme: Collision Learning Iyilestirmeleri (v2)*

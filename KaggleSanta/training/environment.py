@@ -107,16 +107,25 @@ class TreePackingEnvironment(gym.Env):
         # Observation Space
         # tree_features: Her ağaç için (x, y, angle, minx, miny, maxx, maxy, ...) = 10 dim
         # pairwise_features: Her ağaç için k=3 komşu ile rect özellikleri = 30 dim (10 * 3)
-        # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 5 dim
+        # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 8 dim (collision tracking dahil)
         # free_space_features: Boş alan bilgisi = 4 dim [center_x, center_y, area_ratio, n_regions]
+        # collision_map: Binary collision heatmap = (grid_size, grid_size) - NEREYE KOYAMAZ
         self.k_neighbors = 3  # Multi-neighbor için k değeri
+
+        # Collision tracking
+        self.consecutive_collisions = 0
+        self.total_collisions = 0
+        self.max_consecutive_collisions = 10  # Bu kadar üst üste collision = truncate
+        self.last_collision_position = None
+
         self.observation_space = spaces.Dict({
             "tree_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10), dtype=np.float32),
             "pairwise_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10 * self.k_neighbors), dtype=np.float32),
-            "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "scalars": spaces.Box(-np.inf, np.inf, shape=(8,), dtype=np.float32),  # 5 -> 8 (collision info)
             "free_space_features": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(max_trees,), dtype=np.float32),
-            "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)
+            "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32),
+            "collision_map": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)  # YENİ
         })
 
     # ==================== PROPERTIES ====================
@@ -168,58 +177,76 @@ class TreePackingEnvironment(gym.Env):
         self.current_index = 0
         self._strtree = None
         self.prev_union_centroid = None
-        
+
+        # Collision tracking reset
+        self.consecutive_collisions = 0
+        self.total_collisions = 0
+        self.last_collision_position = None
+
         observation = self.get_observation()
         info = {
             "n_placed": 0,
             "n_remaining": self.n_trees,
-            "bbox_size": 0.0
+            "bbox_size": 0.0,
+            "total_collisions": 0,
+            "consecutive_collisions": 0
         }
-        
+
         return observation, info
 
     def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
         """
         Bir adım ilerler: Verilen action ile yeni ağaç yerleştirir.
-        
+
+        GÜNCELLEME: Collision tracking ve truncation eklendi.
+
         Args:
             action: (x, y, rotation) array
-            
+
         Returns:
             observation: Yeni state
             reward: Bu adımın ödülü
             terminated: Episode bitti mi (tüm ağaçlar yerleşti)
-            truncated: Kesintiye uğradı mı
+            truncated: Çok fazla collision = kesinti
             info: Ek bilgiler
         """
         x, y, rotation = action[0], action[1], action[2]
-        
+
         # Ağaç boyutunu hesaba katarak sınırları daralt
         margin = 0.5
         x = np.clip(x, margin, 10.0 - margin)
         y = np.clip(y, margin, 10.0 - margin)
         rotation = np.clip(rotation, 0.0, 360.0)
-        
+
         # Mevcut bbox ALANI (reward hesabı için)
         old_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
-        
+
         # Yeni ağaç oluştur
         new_tree = ChristmasTree(
             center_x=str(x),
             center_y=str(y),
             angle=str(rotation)
         )
-        
+
         # Çarpışma kontrolü - şimdi çarpışma alanı döndürüyor
         collision_area = self._check_collision(new_tree)
         has_collision = collision_area > 0
-        
-        if not has_collision:
+
+        if has_collision:
+            # COLLISION TRACKING
+            self.consecutive_collisions += 1
+            self.total_collisions += 1
+            self.last_collision_position = (x, y, rotation)
+            # Ağaç YERLEŞTİRİLMİYOR ama state feedback var
+        else:
             # Geçerli yerleştirme
             self.placed_trees.append(new_tree)
             self.current_index += 1
             self._update_strtree()
-        
+            # Collision streak sıfırla
+            self.consecutive_collisions = 0
+            self.last_collision_position = None
+
         # Yeni bbox ALANI
         new_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
         
@@ -232,8 +259,8 @@ class TreePackingEnvironment(gym.Env):
         
         # Observation
         observation = self.get_observation()
-        
-        # Info
+
+        # Info (genişletilmiş)
         info = {
             "n_placed": len(self.placed_trees),
             "n_remaining": self.n_trees - self.current_index,
@@ -241,23 +268,29 @@ class TreePackingEnvironment(gym.Env):
             "bbox_area": new_bbox_area,
             "fill_ratio": self.fill_ratio,
             "collision": has_collision,
-            "collision_area": collision_area
+            "collision_area": collision_area,
+            "consecutive_collisions": self.consecutive_collisions,
+            "total_collisions": self.total_collisions,
+            "truncated_by_collision": truncated
         }
-        
+
         return observation, reward, terminated, truncated, info
 
     def get_observation(self) -> Dict[str, np.ndarray]:
         """
         Mevcut state'i observation dictionary olarak döndürür.
 
+        GÜNCELLEME: collision_map ve genişletilmiş scalars eklendi.
+
         Returns:
             Dict containing:
                 - tree_features: (max_trees, 10) her ağacın özellikleri
                 - pairwise_features: (max_trees, 30) k=3 komşu için rect özellikleri
-                - scalars: (5,) global özellikler
+                - scalars: (8,) global özellikler + collision tracking
                 - free_space_features: (4,) boş alan bilgisi
                 - mask: (max_trees,) hangi slotlar dolu
                 - occupancy_grid: (256, 256) doluluk grid'i
+                - collision_map: (256, 256) collision tehlikesi heatmap'i
         """
         n = len(self.placed_trees)
 
@@ -272,17 +305,20 @@ class TreePackingEnvironment(gym.Env):
             pairwise = self._get_multi_neighbor_pairwise_features()
             pairwise_features[:n] = pairwise
 
-        # Scalars: (5,)
-        # Normalize edilmiş değerler
+        # Scalars: (8,) - GENİŞLETİLDİ collision tracking ile
         scalars = np.array([
-            n / self.max_trees,                    # n_placed (normalized)
-            self.bounding_box_size / 1e16,         # bbox_size (normalized by scale)
-            self.fill_ratio,                       # fill_ratio [0-1]
-            (self.n_trees - n) / self.n_trees,     # remaining_ratio [0-1]
-            self.total_tree_area / 1e30            # total_area (normalized)
+            n / self.max_trees,                                    # n_placed (normalized)
+            self.bounding_box_size / 1e16,                         # bbox_size (normalized by scale)
+            self.fill_ratio,                                       # fill_ratio [0-1]
+            (self.n_trees - n) / self.n_trees,                     # remaining_ratio [0-1]
+            self.total_tree_area / 1e30,                           # total_area (normalized)
+            # YENİ: Collision tracking features
+            self.consecutive_collisions / self.max_consecutive_collisions,  # collision_streak [0-1]
+            self.total_collisions / max(self.current_index + self.total_collisions, 1),  # collision_rate [0-1]
+            1.0 if self.last_collision_position else 0.0           # had_collision_last_step
         ], dtype=np.float32)
 
-        # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ (KRİTİK İYİLEŞTİRME)
+        # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ
         free_space_features = self._get_free_space_features()
 
         # Mask: (max_trees,)
@@ -292,13 +328,18 @@ class TreePackingEnvironment(gym.Env):
         # Occupancy Grid: (grid_size, grid_size)
         occupancy_grid = self._get_occupancy_grid()
 
+        # COLLISION MAP: (grid_size, grid_size) - YENİ
+        # Mevcut ağaçların etrafındaki tehlikeli bölgeleri gösterir
+        collision_map = self._get_collision_map()
+
         return {
             "tree_features": tree_features,
             "pairwise_features": pairwise_features,
             "scalars": scalars,
             "free_space_features": free_space_features,
             "mask": mask,
-            "occupancy_grid": occupancy_grid
+            "occupancy_grid": occupancy_grid,
+            "collision_map": collision_map
         }
 
     # ==================== HELPER METHODS ====================
@@ -444,7 +485,7 @@ class TreePackingEnvironment(gym.Env):
         return total_intersection_area
 
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
-                         collision_area: float) -> float:
+                         collision_area: float, has_collision: bool = False) -> float:
         """
         İYİLEŞTİRİLMİŞ Reward Fonksiyonu - Balanced & Dense.
 
@@ -454,11 +495,12 @@ class TreePackingEnvironment(gym.Env):
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
 
-        # Yeni ağacın alanı (referans)
+        # Yeni ağacın alanı (referans için varsayılan değer)
+        # Collision durumunda placed_trees güncellenmediği için default kullan
         if self.placed_trees:
             new_tree_area = self.placed_trees[-1].polygon.area
         else:
-            new_tree_area = norm_sq * 0.01
+            new_tree_area = norm_sq * 0.01  # Default tree area
 
         # Progress ratio (0 = başlangıç, 1 = bitti)
         progress = self.current_index / max(self.n_trees, 1)

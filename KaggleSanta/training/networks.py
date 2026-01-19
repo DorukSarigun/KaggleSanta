@@ -125,7 +125,7 @@ class GridEncoder(nn.Module):
 
 class FreeSpaceEncoder(nn.Module):
     """
-    YENİ: Boş alan özelliklerini (4 dim) embed eder.
+    Boş alan özelliklerini (4 dim) embed eder.
     [center_x, center_y, area_ratio, n_regions]
 
     Input: (batch, 4)
@@ -151,6 +151,59 @@ class FreeSpaceEncoder(nn.Module):
             (batch, embed_dim)
         """
         return self.mlp(free_space_features)
+
+
+class CollisionMapEncoder(nn.Module):
+    """
+    YENİ: Collision heatmap'i encode eder.
+    Agent'ın nereye yerleştirmemesi gerektiğini öğrenmesi için kritik.
+
+    Input: (batch, grid_size, grid_size)
+    Output: (batch, embed_dim)
+    """
+
+    def __init__(self, grid_size: int = 256, embed_dim: int = 64):
+        super().__init__()
+
+        self.cnn = nn.Sequential(
+            # (batch, 1, 256, 256) -> (batch, 32, 128, 128)
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            # (batch, 32, 128, 128) -> (batch, 64, 64, 64)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            # (batch, 64, 64, 64) -> (batch, 64, 32, 32)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            # (batch, 64, 32, 32) -> (batch, 64, 16, 16)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            # (batch, 64, 16, 16) -> (batch, 64, 8, 8)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            # (batch, 64, 8, 8) -> (batch, 64, 4, 4)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            # Flatten
+            nn.Flatten(),  # (batch, 64 * 4 * 4) = (batch, 1024)
+            nn.Linear(1024, embed_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, collision_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            collision_map: (batch, grid_size, grid_size)
+        Returns:
+            (batch, embed_dim)
+        """
+        x = collision_map.unsqueeze(1)  # Add channel dim
+        return self.cnn(x)
 
 
 class TransformerStateEncoder(nn.Module):
@@ -210,18 +263,19 @@ class TransformerStateEncoder(nn.Module):
 
 class ScalarEncoder(nn.Module):
     """
-    Global scalar özellikleri (5 dim) embed eder.
-    
-    Input: (batch, 5)
+    Global scalar özellikleri (8 dim) embed eder.
+    GÜNCELLENDİ: Collision tracking features dahil (5 -> 8 dim)
+
+    Input: (batch, 8)
     Output: (batch, scalar_embed_dim)
     """
-    
-    def __init__(self, input_dim: int = 5, embed_dim: int = 32):
+
+    def __init__(self, input_dim: int = 8, embed_dim: int = 32):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 16),
+            nn.Linear(input_dim, 32),
             nn.ReLU(),
-            nn.Linear(16, embed_dim),
+            nn.Linear(32, embed_dim),
             nn.ReLU()
         )
     
@@ -303,12 +357,13 @@ class Critic(nn.Module):
 class ActorCritic(nn.Module):
     """
     Combined Actor-Critic network for PPO.
-    GÜNCELLENDİ: Free space encoder, deeper transformer, larger embeddings.
+    GÜNCELLENDİ: Collision-aware architecture with collision_map encoder.
     """
 
     def __init__(self, max_trees: int = 200, tree_feature_dim: int = 10,
                  pairwise_feature_dim: int = 30,  # k=3 komşu * 10 feature
-                 scalar_dim: int = 5, free_space_dim: int = 4,
+                 scalar_dim: int = 8,  # GÜNCELLENDİ: 5 -> 8 (collision tracking)
+                 free_space_dim: int = 4,
                  embed_dim: int = 64, state_dim: int = 256, action_dim: int = 3,
                  action_low: np.ndarray = None, action_high: np.ndarray = None):
         super().__init__()
@@ -332,7 +387,6 @@ class ActorCritic(nn.Module):
         self.pairwise_encoder = PairwiseFeatureEncoder(pairwise_feature_dim, embed_dim)
 
         # Transformer (input: combined embed_dim * 2)
-        # GÜNCELLENDİ: 8 heads, 4 layers (daha derin)
         combined_embed_dim = embed_dim * 2
         self.transformer = TransformerStateEncoder(
             embed_dim=combined_embed_dim,
@@ -341,35 +395,39 @@ class ActorCritic(nn.Module):
             state_dim=state_dim
         )
 
-        # Scalar encoder
+        # Scalar encoder (8 dim: 5 original + 3 collision tracking)
         scalar_embed_dim = 32
         self.scalar_encoder = ScalarEncoder(scalar_dim, scalar_embed_dim)
 
-        # Free space encoder (YENİ)
+        # Free space encoder
         free_space_embed_dim = 32
         self.free_space_encoder = FreeSpaceEncoder(free_space_dim, free_space_embed_dim)
 
         # Grid encoder (CNN for 256x256 occupancy grid)
-        # GÜNCELLENDİ: 64 dims (daha büyük)
         grid_embed_dim = 64
         self.grid_encoder = GridEncoder(grid_size=256, embed_dim=grid_embed_dim)
 
-        # Combined state dim = state_dim + scalar_embed_dim + free_space_embed_dim + grid_embed_dim
-        # = 256 + 32 + 32 + 64 = 384
-        combined_state_dim = state_dim + scalar_embed_dim + free_space_embed_dim + grid_embed_dim
+        # COLLISION MAP ENCODER (YENİ - KRİTİK)
+        collision_map_embed_dim = 64
+        self.collision_map_encoder = CollisionMapEncoder(grid_size=256, embed_dim=collision_map_embed_dim)
+
+        # Combined state dim = state_dim + scalar + free_space + grid + collision_map
+        # = 256 + 32 + 32 + 64 + 64 = 448
+        combined_state_dim = state_dim + scalar_embed_dim + free_space_embed_dim + grid_embed_dim + collision_map_embed_dim
 
         # Actor and Critic
         self.actor = Actor(combined_state_dim, action_dim)
         self.critic = Critic(combined_state_dim)
     
     def _encode_state(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encode observation into state vector."""
+        """Encode observation into state vector (collision-aware)."""
         tree_features = obs["tree_features"]
         pairwise_features = obs["pairwise_features"]
         scalars = obs["scalars"]
-        free_space_features = obs["free_space_features"]  # YENİ
+        free_space_features = obs["free_space_features"]
         mask = obs["mask"]
         occupancy_grid = obs["occupancy_grid"]
+        collision_map = obs["collision_map"]  # YENİ - KRİTİK
 
         # Encode tree and pairwise features
         tree_embed = self.tree_encoder(tree_features)  # (batch, max_trees, 64)
@@ -381,18 +439,21 @@ class ActorCritic(nn.Module):
         # Transformer encoding
         state = self.transformer(combined, mask)  # (batch, 256)
 
-        # Scalar encoding
+        # Scalar encoding (now includes collision tracking)
         scalar_embed = self.scalar_encoder(scalars)  # (batch, 32)
 
-        # Free space encoding (YENİ)
+        # Free space encoding
         free_space_embed = self.free_space_encoder(free_space_features)  # (batch, 32)
 
         # Grid encoding (CNN)
         grid_embed = self.grid_encoder(occupancy_grid)  # (batch, 64)
 
-        # Final state: transformer + scalars + free_space + grid
-        # = 256 + 32 + 32 + 64 = 384
-        return torch.cat([state, scalar_embed, free_space_embed, grid_embed], dim=-1)
+        # COLLISION MAP encoding (YENİ - KRİTİK)
+        collision_map_embed = self.collision_map_encoder(collision_map)  # (batch, 64)
+
+        # Final state: transformer + scalars + free_space + grid + collision_map
+        # = 256 + 32 + 32 + 64 + 64 = 448
+        return torch.cat([state, scalar_embed, free_space_embed, grid_embed, collision_map_embed], dim=-1)
     
     def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -485,8 +546,8 @@ def create_network(config: dict = None) -> ActorCritic:
         "max_trees": 200,
         "tree_feature_dim": 10,
         "pairwise_feature_dim": 30,  # k=3 komşu * 10 feature
-        "scalar_dim": 5,
-        "free_space_dim": 4,  # YENİ
+        "scalar_dim": 8,             # GÜNCELLENDİ: 5 -> 8 (collision tracking)
+        "free_space_dim": 4,
         "embed_dim": 64,
         "state_dim": 256,
         "action_dim": 3
