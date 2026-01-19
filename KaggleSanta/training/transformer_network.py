@@ -383,15 +383,18 @@ class CrossAttentionFusion(nn.Module):
 class TransformerActorCritic(nn.Module):
     """
     Transformer-based Actor-Critic for tree placement.
-    
+
     Uses self-attention over all placed trees - no gradient vanishing!
     Every tree can directly attend to every other tree.
+
+    NEW: Collision prediction head for auxiliary learning.
     """
-    
+
     def __init__(
         self,
         tree_dim: int = 39,          # FULL: center (2) + rot (1) + 15 corners × 2 (30) + relative (6) = 39
         scalar_dim: int = 5,         # Global scalar features
+        collision_dim: int = 6,      # Collision features (NEW!)
         embed_dim: int = 128,        # Transformer embedding dim
         n_heads: int = 8,            # Number of attention heads
         n_layers: int = 6,           # Number of transformer layers
@@ -432,6 +435,13 @@ class TransformerActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(64, embed_dim)
         )
+
+        # Collision encoder (NEW! - collision-aware features)
+        self.collision_encoder = nn.Sequential(
+            nn.Linear(collision_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64)
+        )
         
         # Grid encoder (CNN for occupancy grid)
         self.grid_encoder = GridEncoder(embed_dim)
@@ -441,9 +451,9 @@ class TransformerActorCritic(nn.Module):
         
         # Cross-attention fusion
         self.fusion = CrossAttentionFusion(embed_dim, n_heads=4)
-        
-        # State dim after fusion + spatial_context
-        state_dim = embed_dim + 64
+
+        # State dim after fusion + spatial_context + collision_embed
+        state_dim = embed_dim + 64 + 64  # fusion + bbox_context + collision
         
         # Actor head
         self.actor_mean = nn.Sequential(
@@ -468,6 +478,17 @@ class TransformerActorCritic(nn.Module):
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
+        )
+
+        # Collision prediction head (NEW! - auxiliary task)
+        # Predicts probability of collision for current action
+        self.collision_predictor = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Output probability [0, 1]
         )
     
     def encode_trees(
@@ -528,20 +549,22 @@ class TransformerActorCritic(nn.Module):
         scalars: torch.Tensor,
         mask: torch.Tensor = None,
         grid: torch.Tensor = None,
-        bbox: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bbox: torch.Tensor = None,
+        collision_features: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
-        
+
         Args:
             tree_features: (batch, n_trees, tree_dim)
             scalars: (batch, scalar_dim)
             mask: (batch, n_trees) - True for valid trees
             grid: (batch, 512, 512) - occupancy grid
             bbox: (batch, 4) - bounding box coords [minx, miny, maxx, maxy]
-        
+            collision_features: (batch, collision_dim) - collision-aware features (NEW!)
+
         Returns:
-            mean, log_std, value
+            mean, log_std, value, collision_prob
         """
         # Direct spatial encoding from raw coordinates (no MLP)
         tree_seq = self.spatial_encoder(tree_features)  # (batch, n_trees, embed_dim)
@@ -569,15 +592,20 @@ class TransformerActorCritic(nn.Module):
         # Encode bbox spatial context (only bbox now, no free_space)
         batch_size = tree_features.shape[0]
         device = tree_features.device
-        
+
         if bbox is None:
             bbox = torch.zeros(batch_size, 4, device=device)
-        
+
         # Fourier encoding for bbox only (4 dim)
         context_embed = self.spatial_context_encoder(bbox)  # (batch, 64)
-        
-        # Concat fusion output with spatial context embedding
-        state = torch.cat([fusion_out, context_embed], dim=-1)  # (batch, embed_dim + 64)
+
+        # Encode collision features (NEW!)
+        if collision_features is None:
+            collision_features = torch.zeros(batch_size, 6, device=device)
+        collision_embed = self.collision_encoder(collision_features)  # (batch, 64)
+
+        # Concat fusion output with spatial context + collision embeddings
+        state = torch.cat([fusion_out, context_embed, collision_embed], dim=-1)  # (batch, embed_dim + 64 + 64)
         
         # Handle NaN in state
         state = torch.nan_to_num(state, nan=0.0)
@@ -591,8 +619,11 @@ class TransformerActorCritic(nn.Module):
         
         # Critic
         value = self.critic(state)
-        
-        return mean, log_std, value
+
+        # Collision prediction (NEW! - auxiliary task)
+        collision_prob = self.collision_predictor(state)  # (batch, 1)
+
+        return mean, log_std, value, collision_prob
     
     def get_action(
         self,
@@ -601,11 +632,14 @@ class TransformerActorCritic(nn.Module):
         mask: torch.Tensor = None,
         grid: torch.Tensor = None,
         bbox: torch.Tensor = None,
+        collision_features: torch.Tensor = None,
         deterministic: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample action from policy."""
-        
-        mean, log_std, value = self.forward(tree_features, scalars, mask, grid, bbox)
+
+        mean, log_std, value, collision_prob = self.forward(
+            tree_features, scalars, mask, grid, bbox, collision_features
+        )
         
         # Handle NaN
         log_std = torch.nan_to_num(log_std, nan=-2.0)
@@ -623,8 +657,8 @@ class TransformerActorCritic(nn.Module):
         
         # Scale to action bounds
         action_scaled = action * self.action_scale + self.action_bias
-        
-        return action_scaled, log_prob, value
+
+        return action_scaled, log_prob, value, collision_prob
     
     def evaluate_actions(
         self,
@@ -633,11 +667,14 @@ class TransformerActorCritic(nn.Module):
         actions: torch.Tensor,
         mask: torch.Tensor = None,
         grid: torch.Tensor = None,
-        bbox: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bbox: torch.Tensor = None,
+        collision_features: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate actions for PPO update."""
-        
-        mean, log_std, value = self.forward(tree_features, scalars, mask, grid, bbox)
+
+        mean, log_std, value, collision_prob = self.forward(
+            tree_features, scalars, mask, grid, bbox, collision_features
+        )
         
         # Handle NaN in log_std before exp
         log_std = torch.nan_to_num(log_std, nan=-2.0)  # Default to std~0.13
@@ -651,5 +688,5 @@ class TransformerActorCritic(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         log_prob = dist.log_prob(actions_raw).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        
-        return log_prob, value, entropy
+
+        return log_prob, value, entropy, collision_prob

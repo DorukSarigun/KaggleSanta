@@ -43,6 +43,7 @@ class TransformerEnvironment(TreePackingEnvironment):
             "trees": spaces.Box(-np.inf, np.inf, shape=(self.MAX_TREES, self.TREE_DIM), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(self.MAX_TREES,), dtype=np.float32),
             "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "collision_features": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
             "grid": spaces.Box(0, 1, shape=(512, 512), dtype=np.float32),  # Higher res for CNN
             "bbox": spaces.Box(0, 1, shape=(4,), dtype=np.float32)  # [minx, miny, maxx, maxy]
         })
@@ -140,11 +141,15 @@ class TransformerEnvironment(TreePackingEnvironment):
         
         # Occupancy grid (512, 512) - CNN will learn spatial features
         grid = self._get_occupancy_grid(size=512)
-        
+
+        # Collision features (6,) - NEW!
+        collision_features = self._get_collision_features()
+
         return {
             "trees": trees,
             "mask": mask,
             "scalars": scalars,
+            "collision_features": collision_features,
             "grid": grid,
             "bbox": bbox
         }
@@ -175,11 +180,12 @@ class TransformerEnvironment(TreePackingEnvironment):
 
 class TransformerRolloutBuffer:
     """Rollout buffer for transformer observations."""
-    
+
     def __init__(self):
         self.trees = []
         self.masks = []
         self.scalars = []
+        self.collision_features = []
         self.grids = []
         self.bboxes = []
         self.actions = []
@@ -187,11 +193,14 @@ class TransformerRolloutBuffer:
         self.dones = []
         self.log_probs = []
         self.values = []
+        self.collision_probs = []
+        self.collision_labels = []  # Actual collision occurred (0 or 1)
     
-    def add(self, obs: Dict, action, reward, done, log_prob, value):
+    def add(self, obs: Dict, action, reward, done, log_prob, value, collision_prob, collision_label):
         self.trees.append(obs["trees"].copy())
         self.masks.append(obs["mask"].copy())
         self.scalars.append(obs["scalars"].copy())
+        self.collision_features.append(obs["collision_features"].copy())
         self.grids.append(obs["grid"].copy())
         self.bboxes.append(obs["bbox"].copy())
         self.actions.append(action.copy())
@@ -199,11 +208,14 @@ class TransformerRolloutBuffer:
         self.dones.append(done)
         self.log_probs.append(log_prob)
         self.values.append(value)
+        self.collision_probs.append(collision_prob)
+        self.collision_labels.append(collision_label)
     
     def clear(self):
         self.trees = []
         self.masks = []
         self.scalars = []
+        self.collision_features = []
         self.grids = []
         self.bboxes = []
         self.actions = []
@@ -211,6 +223,8 @@ class TransformerRolloutBuffer:
         self.dones = []
         self.log_probs = []
         self.values = []
+        self.collision_probs = []
+        self.collision_labels = []
     
     def get_batches(self, batch_size: int, device: str):
         n = len(self.actions)
@@ -223,10 +237,12 @@ class TransformerRolloutBuffer:
                 "trees": torch.tensor(np.array([self.trees[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "masks": torch.tensor(np.array([self.masks[i] for i in batch_idx]), dtype=torch.bool, device=device),
                 "scalars": torch.tensor(np.array([self.scalars[i] for i in batch_idx]), dtype=torch.float32, device=device),
+                "collision_features": torch.tensor(np.array([self.collision_features[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "grids": torch.tensor(np.array([self.grids[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "bboxes": torch.tensor(np.array([self.bboxes[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "actions": torch.tensor(np.array([self.actions[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "log_probs": torch.tensor(np.array([self.log_probs[i] for i in batch_idx]), dtype=torch.float32, device=device),
+                "collision_labels": torch.tensor(np.array([self.collision_labels[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "indices": batch_idx
             }
 
@@ -285,6 +301,7 @@ class TransformerTrainer:
             "trees": torch.tensor(obs["trees"], dtype=torch.float32, device=self.device).unsqueeze(0),
             "mask": torch.tensor(obs["mask"], dtype=torch.bool, device=self.device).unsqueeze(0),
             "scalars": torch.tensor(obs["scalars"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            "collision_features": torch.tensor(obs["collision_features"], dtype=torch.float32, device=self.device).unsqueeze(0),
             "grid": torch.tensor(obs["grid"], dtype=torch.float32, device=self.device).unsqueeze(0),
             "bbox": torch.tensor(obs["bbox"], dtype=torch.float32, device=self.device).unsqueeze(0)
         }
@@ -292,29 +309,35 @@ class TransformerTrainer:
     def collect_rollouts(self, n_steps: int):
         obs, _ = self.env.reset()
         episode_reward = 0.0
-        
+
         for step in range(n_steps):
             obs_t = self.obs_to_tensor(obs)
-            
+
             with torch.no_grad():
-                action, log_prob, value = self.network.get_action(
-                    obs_t["trees"], obs_t["scalars"], obs_t["mask"], obs_t["grid"], obs_t["bbox"]
+                action, log_prob, value, collision_prob = self.network.get_action(
+                    obs_t["trees"], obs_t["scalars"], obs_t["mask"],
+                    obs_t["grid"], obs_t["bbox"], obs_t["collision_features"]
                 )
-            
+
             action_np = action.cpu().numpy().squeeze()
             log_prob_np = log_prob.cpu().numpy().item()
             value_np = value.cpu().numpy().item()
-            
+            collision_prob_np = collision_prob.cpu().numpy().item()
+
             next_obs, reward, done, truncated, info = self.env.step(action_np)
-            
-            self.buffer.add(obs, action_np, reward, done, log_prob_np, value_np)
-            
+
+            # Collision label: 1 if collision occurred, 0 otherwise
+            collision_label = 1.0 if info.get("collision", False) else 0.0
+
+            self.buffer.add(obs, action_np, reward, done, log_prob_np, value_np,
+                          collision_prob_np, collision_label)
+
             episode_reward += reward
             obs = next_obs
-            
+
             if done or truncated:
                 break
-        
+
         return episode_reward, self.env.bounding_box_size
     
     def compute_gae(self, last_value: float):
@@ -335,26 +358,36 @@ class TransformerTrainer:
     
     def update(self, returns: np.ndarray, advantages: np.ndarray):
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         for epoch in range(self.n_epochs):
             for batch in self.buffer.get_batches(self.batch_size, self.device):
                 batch_returns = torch.tensor(returns[batch["indices"]], dtype=torch.float32, device=self.device)
                 batch_advantages = torch.tensor(advantages[batch["indices"]], dtype=torch.float32, device=self.device)
-                
-                log_probs, values, entropy = self.network.evaluate_actions(
-                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"], batch["grids"], batch["bboxes"]
+
+                log_probs, values, entropy, collision_probs = self.network.evaluate_actions(
+                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"],
+                    batch["grids"], batch["bboxes"], batch["collision_features"]
                 )
-                
+
                 ratio = torch.exp(log_probs - batch["log_probs"])
                 policy_loss1 = -batch_advantages * ratio
                 policy_loss2 = -batch_advantages * torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
                 policy_loss = torch.max(policy_loss1, policy_loss2).mean()
-                
+
                 value_loss = nn.functional.mse_loss(values.squeeze(-1), batch_returns)
                 entropy_loss = -entropy.mean()
-                
-                loss = policy_loss + 0.5 * value_loss + self.ent_coef * entropy_loss
-                
+
+                # Collision prediction loss (NEW! - auxiliary task)
+                collision_loss = nn.functional.binary_cross_entropy(
+                    collision_probs.squeeze(-1),
+                    batch["collision_labels"],
+                    reduction='mean'
+                )
+
+                # Total loss: PPO loss + collision prediction loss
+                # Collision loss weight: 0.1 (auxiliary task, should not dominate)
+                loss = policy_loss + 0.5 * value_loss + self.ent_coef * entropy_loss + 0.1 * collision_loss
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
@@ -427,8 +460,9 @@ class TransformerTrainer:
             with torch.no_grad():
                 obs = self.env._get_observation()
                 obs_t = self.obs_to_tensor(obs)
-                _, _, value = self.network.forward(
-                    obs_t["trees"], obs_t["scalars"], obs_t["mask"]
+                _, _, value, _ = self.network.forward(
+                    obs_t["trees"], obs_t["scalars"], obs_t["mask"],
+                    obs_t["grid"], obs_t["bbox"], obs_t["collision_features"]
                 )
                 last_value = 0.0 if self.buffer.dones[-1] else value.item()
             
