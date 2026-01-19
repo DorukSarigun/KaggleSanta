@@ -27,7 +27,7 @@ class TransformerEnvironment(TreePackingEnvironment):
     """
     
     MAX_TREES = 100  # Maximum trees to track
-    TREE_DIM = 33    # center (2) + rotation (1) + 15 corners × 2 coords = 33
+    TREE_DIM = 39    # center (2) + rotation (1) + 15 corners × 2 coords (30) + relative (6) = 39
     
     def __init__(self, n_trees: int = 50, max_trees: int = 200):
         super().__init__(n_trees=n_trees, max_trees=max_trees)
@@ -43,46 +43,90 @@ class TransformerEnvironment(TreePackingEnvironment):
             "trees": spaces.Box(-np.inf, np.inf, shape=(self.MAX_TREES, self.TREE_DIM), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(self.MAX_TREES,), dtype=np.float32),
             "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
-            "grid": spaces.Box(0, 1, shape=(256, 256), dtype=np.float32)  # Occupancy grid
+            "grid": spaces.Box(0, 1, shape=(512, 512), dtype=np.float32),  # Higher res for CNN
+            "bbox": spaces.Box(0, 1, shape=(4,), dtype=np.float32)  # [minx, miny, maxx, maxy]
         })
     
-    def _get_tree_features_full(self, tree) -> np.ndarray:
+    
+    def _get_tree_features_full(self, tree, last_tree=None, bbox_center=None) -> np.ndarray:
         """
-        Get FULL geometry features for a tree:
-        - center (x, y): 2
-        - rotation: 1
-        - 15 corners (x, y each): 30
-        Total: 33 features
+        Get FULL geometry features for a tree with RELATIVE encoding (NO NORMALIZATION):
+        - center (x, y): 2 - raw [0, 10]
+        - rotation: 1 - raw [0, 360]
+        - 15 corners (x, y each): 30 - raw
+        - RELATIVE: dx, dy to last tree: 2 - raw
+        - RELATIVE: distance, angle to last tree: 2 - raw
+        - RELATIVE: dx, dy to bbox center: 2 - raw
+        Total: 39 features
         """
         norm = float(scale_factor)
         c = tree.polygon.centroid
         
-        # Center (normalized to [0, 1])
-        cx = c.x / norm / 10.0
-        cy = c.y / norm / 10.0
+        # Center (RAW, [0, 10])
+        cx = c.x / norm
+        cy = c.y / norm
         
-        # Rotation (normalized to [0, 1])
-        rot = float(tree.angle) / 360.0
+        # Rotation (RAW, [0, 360])
+        rot = float(tree.angle)
         
-        # All 15 corner coordinates (normalized)
+        # All 15 corner coordinates (RAW)
         coords = np.array(tree.polygon.exterior.coords[:-1])  # Skip repeated last point
-        corners_norm = coords / norm / 10.0  # (15, 2) normalized to [0, 1]
-        corners_flat = corners_norm.flatten()  # (30,)
+        corners_raw = coords / norm  # (15, 2) raw
+        corners_flat = corners_raw.flatten()  # (30,)
         
-        features = np.concatenate([[cx, cy, rot], corners_flat])
+        # RELATIVE ENCODING (RAW)
+        if last_tree is not None:
+            last_c = last_tree.polygon.centroid
+            dx = (c.x - last_c.x) / norm  # Raw delta
+            dy = (c.y - last_c.y) / norm
+            dist = np.sqrt(dx**2 + dy**2)  # Raw distance
+            angle = np.arctan2(dy, dx)  # Raw radians [-π, π]
+        else:
+            dx, dy, dist, angle = 0.0, 0.0, 0.0, 0.0
+        
+        if bbox_center is not None:
+            dx_bbox = cx - bbox_center[0]  # Raw delta
+            dy_bbox = cy - bbox_center[1]
+        else:
+            dx_bbox, dy_bbox = cx - 5.0, cy - 5.0  # Relative to center (5, 5)
+        
+        features = np.concatenate([
+            [cx, cy, rot],           # 3: absolute position (raw)
+            corners_flat,            # 30: corner coords (raw)
+            [dx, dy, dist, angle],   # 4: relative to last tree (raw)
+            [dx_bbox, dy_bbox]       # 2: relative to bbox center (raw)
+        ])
         return features.astype(np.float32)
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
-        """Get observation with FULL geometry tree features + occupancy grid."""
+        """Get observation with FULL geometry tree features + relative encoding + occupancy grid."""
         norm = float(scale_factor)
         n = len(self.placed_trees)
         
-        # Tree features (n_trees, 33) - FULL GEOMETRY
+        # Compute bbox center for relative encoding (RAW)
+        if n > 0:
+            from shapely.ops import unary_union
+            all_polys = [t.polygon for t in self.placed_trees]
+            union = unary_union(all_polys)
+            minx, miny, maxx, maxy = union.bounds
+            bbox_center = ((minx + maxx) / 2 / norm, (miny + maxy) / 2 / norm)  # Raw
+            bbox = np.array([
+                minx / norm,
+                miny / norm,
+                maxx / norm,
+                maxy / norm
+            ], dtype=np.float32)
+        else:
+            bbox_center = (5.0, 5.0)  # Center of [0, 10]
+            bbox = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        
+        # Tree features (n_trees, 39) - FULL GEOMETRY + RELATIVE
         trees = np.zeros((self.MAX_TREES, self.TREE_DIM), dtype=np.float32)
         mask = np.zeros(self.MAX_TREES, dtype=np.float32)
         
         for i in range(min(n, self.MAX_TREES)):
-            trees[i] = self._get_tree_features_full(self.placed_trees[i])
+            last_tree = self.placed_trees[i-1] if i > 0 else None
+            trees[i] = self._get_tree_features_full(self.placed_trees[i], last_tree, bbox_center)
             mask[i] = 1.0
         
         # Scalars (5)
@@ -94,14 +138,15 @@ class TransformerEnvironment(TreePackingEnvironment):
             self.total_tree_area / (norm * norm * 100)
         ], dtype=np.float32)
         
-        # Occupancy grid (256, 256)
-        grid = self._get_occupancy_grid()
+        # Occupancy grid (512, 512) - CNN will learn spatial features
+        grid = self._get_occupancy_grid(size=512)
         
         return {
             "trees": trees,
             "mask": mask,
             "scalars": scalars,
-            "grid": grid
+            "grid": grid,
+            "bbox": bbox
         }
     
     def get_observation(self):
@@ -135,7 +180,8 @@ class TransformerRolloutBuffer:
         self.trees = []
         self.masks = []
         self.scalars = []
-        self.grids = []  # Occupancy grids
+        self.grids = []
+        self.bboxes = []
         self.actions = []
         self.rewards = []
         self.dones = []
@@ -147,6 +193,7 @@ class TransformerRolloutBuffer:
         self.masks.append(obs["mask"].copy())
         self.scalars.append(obs["scalars"].copy())
         self.grids.append(obs["grid"].copy())
+        self.bboxes.append(obs["bbox"].copy())
         self.actions.append(action.copy())
         self.rewards.append(reward)
         self.dones.append(done)
@@ -158,6 +205,7 @@ class TransformerRolloutBuffer:
         self.masks = []
         self.scalars = []
         self.grids = []
+        self.bboxes = []
         self.actions = []
         self.rewards = []
         self.dones = []
@@ -176,6 +224,7 @@ class TransformerRolloutBuffer:
                 "masks": torch.tensor(np.array([self.masks[i] for i in batch_idx]), dtype=torch.bool, device=device),
                 "scalars": torch.tensor(np.array([self.scalars[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "grids": torch.tensor(np.array([self.grids[i] for i in batch_idx]), dtype=torch.float32, device=device),
+                "bboxes": torch.tensor(np.array([self.bboxes[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "actions": torch.tensor(np.array([self.actions[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "log_probs": torch.tensor(np.array([self.log_probs[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "indices": batch_idx
@@ -236,7 +285,8 @@ class TransformerTrainer:
             "trees": torch.tensor(obs["trees"], dtype=torch.float32, device=self.device).unsqueeze(0),
             "mask": torch.tensor(obs["mask"], dtype=torch.bool, device=self.device).unsqueeze(0),
             "scalars": torch.tensor(obs["scalars"], dtype=torch.float32, device=self.device).unsqueeze(0),
-            "grid": torch.tensor(obs["grid"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            "grid": torch.tensor(obs["grid"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            "bbox": torch.tensor(obs["bbox"], dtype=torch.float32, device=self.device).unsqueeze(0)
         }
     
     def collect_rollouts(self, n_steps: int):
@@ -248,7 +298,7 @@ class TransformerTrainer:
             
             with torch.no_grad():
                 action, log_prob, value = self.network.get_action(
-                    obs_t["trees"], obs_t["scalars"], obs_t["mask"], obs_t["grid"]
+                    obs_t["trees"], obs_t["scalars"], obs_t["mask"], obs_t["grid"], obs_t["bbox"]
                 )
             
             action_np = action.cpu().numpy().squeeze()
@@ -292,7 +342,7 @@ class TransformerTrainer:
                 batch_advantages = torch.tensor(advantages[batch["indices"]], dtype=torch.float32, device=self.device)
                 
                 log_probs, values, entropy = self.network.evaluate_actions(
-                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"], batch["grids"]
+                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"], batch["grids"], batch["bboxes"]
                 )
                 
                 ratio = torch.exp(log_probs - batch["log_probs"])
@@ -315,21 +365,53 @@ class TransformerTrainer:
         norm = float(scale_factor)
         
         ax = axes[0]
-        for tree in self.env.placed_trees:
+        # Draw trees with placement order numbers
+        for i, tree in enumerate(self.env.placed_trees):
             coords = np.array(tree.polygon.exterior.coords) / norm
-            ax.fill(coords[:, 0], coords[:, 1], alpha=0.6, color='green')
+            ax.fill(coords[:, 0], coords[:, 1], alpha=0.6, color='green', edgecolor='darkgreen', linewidth=0.5)
+            centroid = tree.polygon.centroid
+            cx, cy = centroid.x / norm, centroid.y / norm
+            ax.text(cx, cy, str(i+1), fontsize=6, ha='center', va='center', color='white', fontweight='bold')
+        
+        # Draw SQUARE bounding box (max dimension) - matches Kaggle scoring
+        if self.env.placed_trees:
+            from shapely.ops import unary_union
+            all_polys = [t.polygon for t in self.env.placed_trees]
+            union = unary_union(all_polys)
+            minx, miny, maxx, maxy = union.bounds
+            minx, miny = minx / norm, miny / norm
+            maxx, maxy = maxx / norm, maxy / norm
+            
+            # Square bbox: use max dimension
+            width = maxx - minx
+            height = maxy - miny
+            bbox_size = max(width, height)
+            
+            # Center the square on the actual bbox center
+            cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+            half = bbox_size / 2
+            
+            bbox = plt.Rectangle((cx - half, cy - half), bbox_size, bbox_size, 
+                                  fill=False, edgecolor='red', linewidth=2, linestyle='--')
+            ax.add_patch(bbox)
+            ax.set_title(f'Episode {episode} | Trees: {len(self.env.placed_trees)} | BBox: {bbox_size:.2f}')
+        else:
+            ax.set_title(f'Episode {episode} | Trees: 0')
+        
         ax.set_xlim(0, 10)
         ax.set_ylim(0, 10)
         ax.set_aspect('equal')
-        ax.set_title(f'Episode {episode}\nTrees: {len(self.env.placed_trees)}')
+        ax.grid(True, alpha=0.3)
         
         if self.rewards_history:
             axes[1].plot(self.rewards_history)
             axes[1].set_title('Episode Rewards')
+            axes[1].grid(True, alpha=0.3)
         
         if self.bbox_history:
             axes[2].plot(self.bbox_history)
             axes[2].set_title('BBox Size')
+            axes[2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig(self.output_dir / f'episode_{episode:04d}.png', dpi=100)
