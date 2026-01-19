@@ -109,12 +109,18 @@ class TreePackingEnvironment(gym.Env):
         # pairwise_features: Her ağaç için k=3 komşu ile rect özellikleri = 30 dim (10 * 3)
         # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 5 dim
         # free_space_features: Boş alan bilgisi = 4 dim [center_x, center_y, area_ratio, n_regions]
+        # collision_features: Çarpışma bilgisi = 6 dim [last_collision_area, collision_risk, avg_min_dist,
+        #                     min_clearance, crowding_factor, collision_history_ratio]
         self.k_neighbors = 3  # Multi-neighbor için k değeri
+        self.collision_history = []  # Son N placement için collision durumu
+        self.collision_history_size = 10  # Track last 10 placements
+
         self.observation_space = spaces.Dict({
             "tree_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10), dtype=np.float32),
             "pairwise_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10 * self.k_neighbors), dtype=np.float32),
             "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
             "free_space_features": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
+            "collision_features": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(max_trees,), dtype=np.float32),
             "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)
         })
@@ -168,6 +174,8 @@ class TreePackingEnvironment(gym.Env):
         self.current_index = 0
         self._strtree = None
         self.prev_union_centroid = None
+        self.collision_history = []
+        self.last_collision_area = 0.0
         
         observation = self.get_observation()
         info = {
@@ -213,7 +221,13 @@ class TreePackingEnvironment(gym.Env):
         # Çarpışma kontrolü - şimdi çarpışma alanı döndürüyor
         collision_area = self._check_collision(new_tree)
         has_collision = collision_area > 0
-        
+
+        # Track collision history
+        self.last_collision_area = collision_area
+        self.collision_history.append(1.0 if has_collision else 0.0)
+        if len(self.collision_history) > self.collision_history_size:
+            self.collision_history.pop(0)
+
         if not has_collision:
             # Geçerli yerleştirme
             self.placed_trees.append(new_tree)
@@ -285,6 +299,9 @@ class TreePackingEnvironment(gym.Env):
         # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ (KRİTİK İYİLEŞTİRME)
         free_space_features = self._get_free_space_features()
 
+        # Collision Features: (6,) - ÇARPIŞMA BİLGİSİ (YENİ!)
+        collision_features = self._get_collision_features()
+
         # Mask: (max_trees,)
         mask = np.zeros(self.max_trees, dtype=np.float32)
         mask[:n] = 1.0
@@ -297,6 +314,7 @@ class TreePackingEnvironment(gym.Env):
             "pairwise_features": pairwise_features,
             "scalars": scalars,
             "free_space_features": free_space_features,
+            "collision_features": collision_features,
             "mask": mask,
             "occupancy_grid": occupancy_grid
         }
@@ -360,6 +378,63 @@ class TreePackingEnvironment(gym.Env):
         
         return grid
     
+    def _get_collision_features(self) -> np.ndarray:
+        """
+        Collision-aware features to help agent learn collision avoidance.
+
+        Returns:
+            6-dim array: [last_collision_area, collision_risk, avg_min_dist,
+                         min_clearance, crowding_factor, collision_history_ratio]
+        """
+        norm = float(scale_factor)
+        n = len(self.placed_trees)
+
+        # 1. Last collision area (normalized)
+        last_collision = min(self.last_collision_area / (norm ** 2), 1.0)
+
+        # 2. Collision risk: ratio of trees with close neighbors
+        collision_risk = 0.0
+        avg_min_dist = 1.0
+        min_clearance = 1.0
+
+        if n >= 2:
+            min_distances = []
+            for tree in self.placed_trees:
+                min_dist = float('inf')
+                for other in self.placed_trees:
+                    if tree is not other:
+                        dist = tree.polygon.distance(other.polygon) / norm
+                        min_dist = min(min_dist, dist)
+                min_distances.append(min_dist)
+
+            # Average minimum distance
+            avg_min_dist = np.mean(min_distances)
+
+            # Minimum clearance across all trees
+            min_clearance = np.min(min_distances)
+
+            # Collision risk: how many trees are very close (< 0.3 distance)
+            close_threshold = 0.3
+            close_count = sum(1 for d in min_distances if d < close_threshold)
+            collision_risk = close_count / n
+
+        # 3. Crowding factor: based on fill ratio and tree density
+        crowding_factor = self.fill_ratio if n > 0 else 0.0
+
+        # 4. Collision history ratio
+        collision_history_ratio = 0.0
+        if len(self.collision_history) > 0:
+            collision_history_ratio = sum(self.collision_history) / len(self.collision_history)
+
+        return np.array([
+            last_collision,           # 0-1, normalized collision area
+            collision_risk,           # 0-1, ratio of risky placements
+            min(avg_min_dist, 1.0),  # 0-1, average minimum distance
+            min(min_clearance, 1.0), # 0-1, minimum clearance
+            crowding_factor,         # 0-1, current crowding
+            collision_history_ratio  # 0-1, historical collision rate
+        ], dtype=np.float32)
+
     def _get_free_space_features(self) -> np.ndarray:
         """
         Boş alan analizi - en büyük boş bölgeyi bul.
@@ -446,100 +521,97 @@ class TreePackingEnvironment(gym.Env):
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        İYİLEŞTİRİLMİŞ Reward Fonksiyonu - Balanced & Dense.
+        İYİLEŞTİRİLMİŞ Reward Fonksiyonu - GRADIENT-BASED COLLISION PENALTY.
 
         Değişiklikler:
-        SIMPLIFIED: Sadece Kaggle metriği ve collision penalty.
+        1. Gradient-based collision penalty (smooth, informative)
+        2. Near-collision warnings (soft penalties for risky placements)
+        3. Kaggle metric improvement bonus
+        4. Placement bonus
         """
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
-
-        # Yeni ağacın alanı (referans)
-        if self.placed_trees:
-            new_tree_area = self.placed_trees[-1].polygon.area
-        else:
-            new_tree_area = norm_sq * 0.01
 
         # Progress ratio (0 = başlangıç, 1 = bitti)
         progress = self.current_index / max(self.n_trees, 1)
         n_placed = len(self.placed_trees)
 
-        # ==================== 1. COLLISION PENALTY (Ağır) ====================
+        # ==================== 1. COLLISION PENALTY (GRADIENT-BASED) ====================
         if collision_area > 0:
-            collision_penalty = -20.0  # Sabit ağır ceza
+            # Normalize collision area to [0, 1]
+            # Typical tree area is ~0.01 * norm_sq
+            typical_tree_area = 0.01 * norm_sq
+            collision_ratio = min(collision_area / typical_tree_area, 1.0)
+
+            # Smooth gradient penalty: increases with overlap severity
+            # Small overlap: ~-5, Large overlap: ~-20
+            collision_penalty = -5.0 - (15.0 * collision_ratio)
+
+            # Early return BUT keep going (don't terminate episode)
+            # This allows learning from near-collisions
             return collision_penalty
 
-        # ==================== 2. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
+        # ==================== 2. NEAR-COLLISION WARNING (SOFT PENALTY) ====================
+        # Check if placement is risky (very close to existing trees)
+        near_collision_penalty = 0.0
+        if n_placed >= 1:
+            # Get minimum distance to any existing tree
+            last_tree = self.placed_trees[-1] if not collision_area > 0 else None
+            if last_tree is not None:
+                min_distance = float('inf')
+                for tree in self.placed_trees[:-1]:
+                    dist = last_tree.polygon.distance(tree.polygon)
+                    min_distance = min(min_distance, dist)
+
+                # Normalize distance
+                norm = float(scale_factor)
+                normalized_dist = min_distance / norm
+
+                # Soft penalty for distances < 0.5
+                if normalized_dist < 0.5:
+                    # Smoothly increase penalty as distance decreases
+                    # dist=0.5 -> penalty=0, dist=0.1 -> penalty=-2.0
+                    near_collision_penalty = -2.0 * (1.0 - normalized_dist / 0.5)
+
+        # ==================== 3. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
         # Her başarılı yerleşim = +1 bonus
-        reward = 1.0  # Base placement bonus
-        
+        reward = 1.0 + near_collision_penalty  # Base placement bonus + safety check
+
         # Kaggle score = s² / n where s = max(width, height)
         # Lower is better -> improvement = old - new
         if old_bbox_area > 0 and new_bbox_area > 0 and n_placed > 0:
             # Old Kaggle score (before this tree)
             old_bbox_size = np.sqrt(old_bbox_area) / float(scale_factor)
             old_kaggle = (old_bbox_size ** 2) / max(n_placed - 1, 1) if n_placed > 1 else 0
-            
+
             # New Kaggle score (after this tree)
             new_bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
             new_kaggle = (new_bbox_size ** 2) / n_placed
-            
+
             # Improvement: old - new (positive = good)
             kaggle_improvement = old_kaggle - new_kaggle
-            
-            # Add Kaggle improvement to placement bonus
-            reward += kaggle_improvement
 
-        # ==================== COMMENTED OUT (for future use) ====================
-        # 
-        # # 2. BASE PLACEMENT BONUS
-        # reward += 0.1
-        #
-        # # 4. EXPANSION PENALTY (Progressive)
-        # if old_bbox_area > 0 and new_bbox_area > 0:
-        #     expansion = new_bbox_area - old_bbox_area
-        #     if expansion > 0:
-        #         expansion_ratio = expansion / old_bbox_area
-        #         penalty_mult = 0.05 + progress * 0.1
-        #         expansion_penalty = expansion_ratio * penalty_mult
-        #         reward -= min(expansion_penalty, 0.15)
-        #
-        # # 5. LOCAL DENSITY BONUS
-        # if n_placed >= 2:
-        #     last_tree = self.placed_trees[-1]
-        #     min_distance = float('inf')
-        #     for tree in self.placed_trees[:-1]:
-        #         dist = last_tree.polygon.distance(tree.polygon)
-        #         min_distance = min(min_distance, dist)
-        #     norm = float(scale_factor)
-        #     normalized_dist = min_distance / norm
-        #     if normalized_dist < 1.0:
-        #         density_bonus = 0.1 * (1.0 - normalized_dist)
-        #         reward += density_bonus
-        #
-        # # 6. PROGRESS BONUS (Milestone)
-        # milestones = [0.25, 0.50, 0.75, 1.0]
-        # for milestone in milestones:
-        #     threshold = int(self.n_trees * milestone)
-        #     if n_placed == threshold and n_placed > 0:
-        #         reward += 0.15
-        #
-        # # 7. EPISODE END BONUS
-        # if self.current_index >= self.n_trees:
-        #     bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
-        #     if n_placed > 0 and bbox_size > 0:
-        #         final_kaggle = (bbox_size ** 2) / n_placed
-        #         ideal_area = self.total_tree_area / 0.6
-        #         ideal_size = np.sqrt(ideal_area) / float(scale_factor)
-        #         ideal_kaggle = (ideal_size ** 2) / self.n_trees
-        #         score_ratio = ideal_kaggle / max(final_kaggle, 0.01)
-        #         if score_ratio > 0.5:
-        #             final_bonus = 0.5 * score_ratio
-        #         elif score_ratio > 0.3:
-        #             final_bonus = 0.2
-        #         else:
-        #             final_bonus = -0.2
-        #         reward += np.clip(final_bonus, -0.3, 0.5)
+            # Scale kaggle improvement (it's usually small, ~0.001-0.01)
+            # Amplify it to balance with placement bonus
+            reward += kaggle_improvement * 10.0
+
+        # ==================== 4. DENSITY BONUS (Encourage tight packing) ====================
+        # Reward for placing trees close together (but not TOO close)
+        if n_placed >= 2 and collision_area == 0:
+            last_tree = self.placed_trees[-1]
+            min_distance = float('inf')
+            for tree in self.placed_trees[:-1]:
+                dist = last_tree.polygon.distance(tree.polygon)
+                min_distance = min(min_distance, dist)
+
+            norm = float(scale_factor)
+            normalized_dist = min_distance / norm
+
+            # Optimal distance: 0.3 - 0.7 (close but safe)
+            # Sweet spot bonus
+            if 0.3 <= normalized_dist <= 0.7:
+                density_bonus = 0.5 * (1.0 - abs(normalized_dist - 0.5) / 0.2)
+                reward += density_bonus
 
         return reward
 
