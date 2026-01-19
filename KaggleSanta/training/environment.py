@@ -191,15 +191,11 @@ class TreePackingEnvironment(gym.Env):
         """
         x, y, rotation = action[0], action[1], action[2]
         
-        # İLK AĞAÇ HER ZAMAN MERKEZE
-        if len(self.placed_trees) == 0:
-            x, y, rotation = 5.0, 5.0, 0.0
-        else:
-            # Ağaç boyutunu hesaba katarak sınırları daralt
-            margin = 0.5
-            x = np.clip(x, margin, 10.0 - margin)
-            y = np.clip(y, margin, 10.0 - margin)
-            rotation = np.clip(rotation, 0.0, 360.0)
+        # Ağaç boyutunu hesaba katarak sınırları daralt
+        margin = 0.5
+        x = np.clip(x, margin, 10.0 - margin)
+        y = np.clip(y, margin, 10.0 - margin)
+        rotation = np.clip(rotation, 0.0, 360.0)
         
         # Mevcut bbox ALANI (reward hesabı için)
         old_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
@@ -350,6 +346,57 @@ class TreePackingEnvironment(gym.Env):
         
         return grid
     
+    def _get_free_space_features(self) -> np.ndarray:
+        """
+        Boş alan analizi - en büyük boş bölgeyi bul.
+        
+        Returns:
+            4-dim array: [center_x, center_y, area_ratio, n_regions]
+        """
+        try:
+            from scipy.ndimage import label
+        except ImportError:
+            return np.zeros(4, dtype=np.float32)
+        
+        if not self.placed_trees:
+            # Tüm alan boş
+            return np.array([0.5, 0.5, 1.0, 1], dtype=np.float32)
+        
+        # Get occupancy grid
+        grid = self._get_occupancy_grid()
+        
+        # Boş hücreler (fill ratio < 0.1)
+        free_mask = (grid < 0.1).astype(np.uint8)
+        
+        # Connected components
+        labeled, n_regions = label(free_mask)
+        
+        if n_regions == 0:
+            return np.array([0.5, 0.5, 0.0, 0], dtype=np.float32)
+        
+        # En büyük bölgeyi bul
+        largest_area = 0
+        largest_idx = 1
+        for i in range(1, n_regions + 1):
+            area = np.sum(labeled == i)
+            if area > largest_area:
+                largest_area = area
+                largest_idx = i
+        
+        # En büyük bölgenin merkezi
+        coords = np.argwhere(labeled == largest_idx)
+        if len(coords) > 0:
+            center_y, center_x = coords.mean(axis=0)
+        else:
+            center_x, center_y = self.grid_size / 2, self.grid_size / 2
+        
+        # Normalize to [0, 1]
+        center_x = center_x / self.grid_size
+        center_y = center_y / self.grid_size
+        area_ratio = largest_area / (self.grid_size ** 2)
+        
+        return np.array([center_x, center_y, area_ratio, min(n_regions / 10.0, 1.0)], dtype=np.float32)
+    
     def _check_collision(self, new_tree: ChristmasTree) -> float:
         """
         Yeni ağacın mevcut ağaçlarla çarpışma alanını hesaplar.
@@ -385,9 +432,13 @@ class TreePackingEnvironment(gym.Env):
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        Reward fonksiyonu - Tamamen ALAN bazlı.
+        Reward fonksiyonu - Balanced Multi-Component.
         
-        Tüm metrikler alan oranları olarak hesaplanır.
+        Components:
+        1. Collision penalty
+        2. Progressive placement bonus (artan puan)
+        3. DECREASING expansion penalty (azalan ceza)
+        4. Episode end bonus
         """
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
@@ -396,44 +447,49 @@ class TreePackingEnvironment(gym.Env):
         if self.placed_trees:
             new_tree_area = self.placed_trees[-1].polygon.area
         else:
-            new_tree_area = norm_sq * 0.01  # fallback
+            new_tree_area = norm_sq * 0.01
+        
+        # Progress ratio (0 = başlangıç, 1 = bitti)
+        progress = self.current_index / max(self.n_trees, 1)
+        n_placed = len(self.placed_trees)
         
         # ==================== COLLISION PENALTY ====================
-        # collision_area / new_tree_area oranı → ne kadar overlap var?
         if collision_area > 0:
             overlap_ratio = collision_area / new_tree_area
-            # 0.1 overlap = -2, 1.0 overlap (tam üst üste) = -20
-            collision_penalty = min(overlap_ratio * 20.0, 20.0)
+            collision_penalty = min(overlap_ratio * 10.0, 10.0)
             reward -= collision_penalty
-            return reward  # Collision varsa diğerlerini hesaplama
+            return reward
         
-        # ==================== TREE PLACEMENT BONUS ====================
-        # Başarılı ağaç yerleştirme (collision yok): +2 puan
-        reward += 2.0
+        # ==================== NO COLLISION: BONUSLAR ====================
         
-        # ==================== BBOX EXPANSION PENALTY ====================
-        # (new_bbox - old_bbox) / new_tree_area → ağaç alanına göre ne kadar genişledi?
+        # Progressive placement bonus: daha fazla ağaç = daha fazla puan
+        # 1. ağaç = 0.5, 25. ağaç = 1.5, 50. ağaç = 2.5
+        placement_bonus = 0.5 + (n_placed / self.n_trees) * 2.0
+        reward += placement_bonus
+        
+        # Delta fill ratio bonus
+        if old_bbox_area > 0 and new_bbox_area > 0:
+            old_fill = (self.total_tree_area - new_tree_area) / old_bbox_area
+            new_fill = self.total_tree_area / new_bbox_area
+            delta_fill = np.clip(new_fill - old_fill, -0.5, 0.5)
+            reward += delta_fill * 10.0
+        
+        # INCREASING expansion penalty: oyun ilerledikçe ceza ARTAR
+        # Başta toleranslı, sonda katı (önce yayıl, sonra kompakt ol)
         if old_bbox_area > 0:
             expansion = new_bbox_area - old_bbox_area
             if expansion > 0:
                 expansion_ratio = expansion / new_tree_area
-                # 1x ağaç alanı kadar genişleme = -1
-                expansion_penalty = min(expansion_ratio * 1.0, 5.0)
-                reward -= expansion_penalty
-        else:
-            reward += 0.5  # İlk ağaç bonusu
-        
-        # ==================== FILL RATIO BONUS ====================
-        # fill_ratio = total_tree_area / bbox_area
-        # Yüksek fill ratio = kompakt yerleşim = iyi
-        reward += self.fill_ratio * 2.0
+                # Progress 0: penalty_mult=0.2 (hafif ceza), Progress 1: penalty_mult=1.0 (tam ceza)
+                penalty_mult = 0.2 + progress * 0.8
+                expansion_penalty = expansion_ratio * penalty_mult * 3.0
+                reward -= min(expansion_penalty, 5.0)
         
         # ==================== EPISODE END BONUS ====================
         if self.current_index >= self.n_trees:
-            # final_score ∝ 1/bbox_size, log scale
             bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
             if bbox_size > 0:
-                final_bonus = -np.log(bbox_size + 1e-6)
+                final_bonus = -np.log(bbox_size + 1e-6) * 5.0
                 reward += final_bonus
         
         return reward

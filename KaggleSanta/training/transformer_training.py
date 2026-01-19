@@ -23,101 +23,66 @@ from transformer_network import TransformerActorCritic
 class TransformerEnvironment(TreePackingEnvironment):
     """
     Environment for Transformer training.
-    Returns sequence of tree features + global scalars.
+    Uses ABSOLUTE coordinates with full geometry features.
     """
     
     MAX_TREES = 100  # Maximum trees to track
-    TREE_DIM = 25    # 5 center + 20 corner features (5 corners × 4: dx, dy, dist, direction)
-    
-    # Key corner indices in polygon (15 vertices total)
-    CORNER_INDICES = [0, 5, 14, 8, 7]  # Tip, LeftWing, RightWing, TrunkLeft, TrunkRight
+    TREE_DIM = 33    # center (2) + rotation (1) + 15 corners × 2 coords = 33
     
     def __init__(self, n_trees: int = 50, max_trees: int = 200):
         super().__init__(n_trees=n_trees, max_trees=max_trees)
         
         from gymnasium import spaces
+        # ABSOLUTE action space: x, y, rotation
         self.action_space = spaces.Box(
-            low=np.array([0.0, -180.0, 0.0], dtype=np.float32),
-            high=np.array([3.0, 180.0, 360.0], dtype=np.float32)
+            low=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([10.0, 10.0, 360.0], dtype=np.float32)
         )
         
         self.observation_space = spaces.Dict({
             "trees": spaces.Box(-np.inf, np.inf, shape=(self.MAX_TREES, self.TREE_DIM), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(self.MAX_TREES,), dtype=np.float32),
-            "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32)
+            "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "grid": spaces.Box(0, 1, shape=(256, 256), dtype=np.float32)  # Occupancy grid
         })
-        
-        self.reference_point = (5.0, 5.0)
     
-    def _get_key_corners(self, tree) -> np.ndarray:
-        """Get 5 key corner coordinates from tree polygon."""
-        coords = np.array(tree.polygon.exterior.coords)
-        corners = []
-        for idx in self.CORNER_INDICES:
-            if idx < len(coords):
-                corners.append(coords[idx])
-            else:
-                corners.append(coords[0])  # fallback to tip
-        return np.array(corners)  # (5, 2)
-    
-    def _get_tree_features_relative(self, tree_idx: int) -> np.ndarray:
+    def _get_tree_features_full(self, tree) -> np.ndarray:
         """
-        Get RELATIVE features for a tree.
-        Features: 
-          - 5 center-based: dx_last, dy_last, dist_last, direction_last, rotation
-          - 20 corner-based: 5 corners × (dx, dy, dist, direction)
+        Get FULL geometry features for a tree:
+        - center (x, y): 2
+        - rotation: 1
+        - 15 corners (x, y each): 30
+        Total: 33 features
         """
         norm = float(scale_factor)
-        tree = self.placed_trees[tree_idx]
         c = tree.polygon.centroid
-        tx, ty = c.x / norm, c.y / norm  # Tree position [0-10]
         
-        # ===== CENTER-BASED FEATURES (5) =====
-        if tree_idx > 0:
-            prev = self.placed_trees[tree_idx - 1]
-            pc = prev.polygon.centroid
-            px, py = pc.x / norm, pc.y / norm
-            dx_to_last = (tx - px) / 10.0
-            dy_to_last = (ty - py) / 10.0
-            dist_to_last = np.sqrt(dx_to_last**2 + dy_to_last**2) * 10.0
-            direction_to_last = np.arctan2(dy_to_last, dx_to_last) / np.pi  # [-1, 1]
-        else:
-            dx_to_last, dy_to_last, dist_to_last, direction_to_last = 0.0, 0.0, 0.0, 0.0
+        # Center (normalized to [0, 1])
+        cx = c.x / norm / 10.0
+        cy = c.y / norm / 10.0
         
-        rotation = float(tree.angle) / 360.0
+        # Rotation (normalized to [0, 1])
+        rot = float(tree.angle) / 360.0
         
-        center_features = [dx_to_last, dy_to_last, dist_to_last, direction_to_last, rotation]
+        # All 15 corner coordinates (normalized)
+        coords = np.array(tree.polygon.exterior.coords[:-1])  # Skip repeated last point
+        corners_norm = coords / norm / 10.0  # (15, 2) normalized to [0, 1]
+        corners_flat = corners_norm.flatten()  # (30,)
         
-        # ===== CORNER-BASED FEATURES (20) =====
-        corner_features = []
-        current_corners = self._get_key_corners(tree) / norm  # (5, 2)
-        
-        if tree_idx > 0:
-            prev_corners = self._get_key_corners(self.placed_trees[tree_idx - 1]) / norm
-        else:
-            # First tree: corners relative to self (all zeros)
-            prev_corners = current_corners.copy()
-        
-        for i in range(5):
-            dx = (current_corners[i, 0] - prev_corners[i, 0]) / 10.0  # Normalize
-            dy = (current_corners[i, 1] - prev_corners[i, 1]) / 10.0
-            dist = np.sqrt(dx**2 + dy**2) * 10.0
-            direction = np.arctan2(dy, dx) / np.pi  # Normalize to [-1, 1]
-            corner_features.extend([dx, dy, dist, direction])
-        
-        return np.array(center_features + corner_features, dtype=np.float32)
+        features = np.concatenate([[cx, cy, rot], corners_flat])
+        return features.astype(np.float32)
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
-        """Get observation with RELATIVE tree features."""
+        """Get observation with FULL geometry tree features + occupancy grid."""
         norm = float(scale_factor)
         n = len(self.placed_trees)
         
-        # Tree features (n_trees, 6) - RELATIVE
+        # Tree features (n_trees, 33) - FULL GEOMETRY
         trees = np.zeros((self.MAX_TREES, self.TREE_DIM), dtype=np.float32)
         mask = np.zeros(self.MAX_TREES, dtype=np.float32)
         
         for i in range(min(n, self.MAX_TREES)):
-            trees[i] = self._get_tree_features_relative(i)
+            trees[i] = self._get_tree_features_full(self.placed_trees[i])
             mask[i] = 1.0
         
         # Scalars (5)
@@ -129,44 +94,32 @@ class TransformerEnvironment(TreePackingEnvironment):
             self.total_tree_area / (norm * norm * 100)
         ], dtype=np.float32)
         
+        # Occupancy grid (256, 256)
+        grid = self._get_occupancy_grid()
+        
         return {
             "trees": trees,
             "mask": mask,
-            "scalars": scalars
+            "scalars": scalars,
+            "grid": grid
         }
-    
-    def _relative_to_absolute(self, distance, direction, rotation):
-        """Convert relative action to absolute coordinates."""
-        if not self.placed_trees:
-            ref_x, ref_y = self.reference_point
-        else:
-            last = self.placed_trees[-1]
-            c = last.polygon.centroid
-            norm = float(scale_factor)
-            ref_x = c.x / norm
-            ref_y = c.y / norm
-        
-        dir_rad = math.radians(direction)
-        x = ref_x + distance * math.cos(dir_rad)
-        y = ref_y + distance * math.sin(dir_rad)
-        
-        margin = 0.5
-        x = np.clip(x, margin, 10.0 - margin)
-        y = np.clip(y, margin, 10.0 - margin)
-        rotation = np.clip(rotation, 0.0, 360.0)
-        
-        return x, y, rotation
     
     def get_observation(self):
         """Override to return our observation format."""
         return self._get_observation()
     
     def step(self, action: np.ndarray):
-        distance, direction, rotation = action[0], action[1], action[2]
-        x, y, rot = self._relative_to_absolute(distance, direction, rotation)
-        abs_action = np.array([x, y, rot], dtype=np.float32)
+        """Step with ABSOLUTE coordinates."""
+        x, y, rotation = action[0], action[1], action[2]
         
-        # Call parent step - get_observation is overridden
+        # Clip to valid range
+        x = np.clip(x, 0.5, 9.5)
+        y = np.clip(y, 0.5, 9.5)
+        rotation = np.clip(rotation, 0.0, 360.0)
+        
+        abs_action = np.array([x, y, rotation], dtype=np.float32)
+        
+        # Call parent step
         _, reward, terminated, truncated, info = super().step(abs_action)
         return self._get_observation(), reward, terminated, truncated, info
     
@@ -182,6 +135,7 @@ class TransformerRolloutBuffer:
         self.trees = []
         self.masks = []
         self.scalars = []
+        self.grids = []  # Occupancy grids
         self.actions = []
         self.rewards = []
         self.dones = []
@@ -192,6 +146,7 @@ class TransformerRolloutBuffer:
         self.trees.append(obs["trees"].copy())
         self.masks.append(obs["mask"].copy())
         self.scalars.append(obs["scalars"].copy())
+        self.grids.append(obs["grid"].copy())
         self.actions.append(action.copy())
         self.rewards.append(reward)
         self.dones.append(done)
@@ -202,6 +157,7 @@ class TransformerRolloutBuffer:
         self.trees = []
         self.masks = []
         self.scalars = []
+        self.grids = []
         self.actions = []
         self.rewards = []
         self.dones = []
@@ -219,6 +175,7 @@ class TransformerRolloutBuffer:
                 "trees": torch.tensor(np.array([self.trees[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "masks": torch.tensor(np.array([self.masks[i] for i in batch_idx]), dtype=torch.bool, device=device),
                 "scalars": torch.tensor(np.array([self.scalars[i] for i in batch_idx]), dtype=torch.float32, device=device),
+                "grids": torch.tensor(np.array([self.grids[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "actions": torch.tensor(np.array([self.actions[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "log_probs": torch.tensor(np.array([self.log_probs[i] for i in batch_idx]), dtype=torch.float32, device=device),
                 "indices": batch_idx
@@ -278,7 +235,8 @@ class TransformerTrainer:
         return {
             "trees": torch.tensor(obs["trees"], dtype=torch.float32, device=self.device).unsqueeze(0),
             "mask": torch.tensor(obs["mask"], dtype=torch.bool, device=self.device).unsqueeze(0),
-            "scalars": torch.tensor(obs["scalars"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            "scalars": torch.tensor(obs["scalars"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            "grid": torch.tensor(obs["grid"], dtype=torch.float32, device=self.device).unsqueeze(0)
         }
     
     def collect_rollouts(self, n_steps: int):
@@ -290,7 +248,7 @@ class TransformerTrainer:
             
             with torch.no_grad():
                 action, log_prob, value = self.network.get_action(
-                    obs_t["trees"], obs_t["scalars"], obs_t["mask"]
+                    obs_t["trees"], obs_t["scalars"], obs_t["mask"], obs_t["grid"]
                 )
             
             action_np = action.cpu().numpy().squeeze()
@@ -334,7 +292,7 @@ class TransformerTrainer:
                 batch_advantages = torch.tensor(advantages[batch["indices"]], dtype=torch.float32, device=self.device)
                 
                 log_probs, values, entropy = self.network.evaluate_actions(
-                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"]
+                    batch["trees"], batch["scalars"], batch["actions"], batch["masks"], batch["grids"]
                 )
                 
                 ratio = torch.exp(log_probs - batch["log_probs"])
