@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import numpy as np
 
 from shapely.geometry import Polygon
@@ -106,12 +106,15 @@ class TreePackingEnvironment(gym.Env):
         
         # Observation Space
         # tree_features: Her ağaç için (x, y, angle, minx, miny, maxx, maxy, ...) = 10 dim
-        # pairwise_features: Her ağaç için komşu ile rect özellikleri = 10 dim
+        # pairwise_features: Her ağaç için k=3 komşu ile rect özellikleri = 30 dim (10 * 3)
         # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 5 dim
+        # free_space_features: Boş alan bilgisi = 4 dim [center_x, center_y, area_ratio, n_regions]
+        self.k_neighbors = 3  # Multi-neighbor için k değeri
         self.observation_space = spaces.Dict({
             "tree_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10), dtype=np.float32),
-            "pairwise_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10), dtype=np.float32),
+            "pairwise_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10 * self.k_neighbors), dtype=np.float32),
             "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "free_space_features": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(max_trees,), dtype=np.float32),
             "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)
         })
@@ -246,27 +249,29 @@ class TreePackingEnvironment(gym.Env):
     def get_observation(self) -> Dict[str, np.ndarray]:
         """
         Mevcut state'i observation dictionary olarak döndürür.
-        
+
         Returns:
             Dict containing:
                 - tree_features: (max_trees, 10) her ağacın özellikleri
-                - pairwise_features: (max_trees, 10) pair rect özellikleri
+                - pairwise_features: (max_trees, 30) k=3 komşu için rect özellikleri
                 - scalars: (5,) global özellikler
+                - free_space_features: (4,) boş alan bilgisi
                 - mask: (max_trees,) hangi slotlar dolu
+                - occupancy_grid: (256, 256) doluluk grid'i
         """
         n = len(self.placed_trees)
-        
+
         # Tree features: (max_trees, 10)
         tree_features = np.zeros((self.max_trees, 10), dtype=np.float32)
         for i, tree in enumerate(self.placed_trees):
             tree_features[i] = self._get_tree_features(tree)
-        
-        # Pairwise features: (max_trees, 10)
-        pairwise_features = np.zeros((self.max_trees, 10), dtype=np.float32)
+
+        # Pairwise features: (max_trees, 30) - k=3 komşu
+        pairwise_features = np.zeros((self.max_trees, 10 * self.k_neighbors), dtype=np.float32)
         if n >= 2:
-            pairwise = self._get_pairwise_features()
+            pairwise = self._get_multi_neighbor_pairwise_features()
             pairwise_features[:n] = pairwise
-        
+
         # Scalars: (5,)
         # Normalize edilmiş değerler
         scalars = np.array([
@@ -276,18 +281,22 @@ class TreePackingEnvironment(gym.Env):
             (self.n_trees - n) / self.n_trees,     # remaining_ratio [0-1]
             self.total_tree_area / 1e30            # total_area (normalized)
         ], dtype=np.float32)
-        
+
+        # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ (KRİTİK İYİLEŞTİRME)
+        free_space_features = self._get_free_space_features()
+
         # Mask: (max_trees,)
         mask = np.zeros(self.max_trees, dtype=np.float32)
         mask[:n] = 1.0
-        
+
         # Occupancy Grid: (grid_size, grid_size)
         occupancy_grid = self._get_occupancy_grid()
-        
+
         return {
             "tree_features": tree_features,
             "pairwise_features": pairwise_features,
             "scalars": scalars,
+            "free_space_features": free_space_features,
             "mask": mask,
             "occupancy_grid": occupancy_grid
         }
@@ -432,66 +441,114 @@ class TreePackingEnvironment(gym.Env):
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        Reward fonksiyonu - Balanced Multi-Component.
-        
-        Components:
-        1. Collision penalty
-        2. Progressive placement bonus (artan puan)
-        3. DECREASING expansion penalty (azalan ceza)
-        4. Episode end bonus
+        İYİLEŞTİRİLMİŞ Reward Fonksiyonu - Balanced & Dense.
+
+        Değişiklikler:
+        1. Tüm bileşenler [-1, 1] aralığına normalize edildi
+        2. Dense intermediate rewards eklendi
+        3. Local density bonus eklendi
+        4. Potential-based shaping uygulandı
+        5. Exploration bonusu eklendi
         """
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
-        
+
         # Yeni ağacın alanı (referans)
         if self.placed_trees:
             new_tree_area = self.placed_trees[-1].polygon.area
         else:
             new_tree_area = norm_sq * 0.01
-        
+
         # Progress ratio (0 = başlangıç, 1 = bitti)
         progress = self.current_index / max(self.n_trees, 1)
         n_placed = len(self.placed_trees)
-        
-        # ==================== COLLISION PENALTY ====================
+
+        # ==================== 1. COLLISION PENALTY (Normalized) ====================
         if collision_area > 0:
-            overlap_ratio = collision_area / new_tree_area
-            collision_penalty = min(overlap_ratio * 10.0, 10.0)
-            reward -= collision_penalty
-            return reward
-        
-        # ==================== NO COLLISION: BONUSLAR ====================
-        
-        # Progressive placement bonus: daha fazla ağaç = daha fazla puan
-        # 1. ağaç = 0.5, 25. ağaç = 1.5, 50. ağaç = 2.5
-        placement_bonus = 0.5 + (n_placed / self.n_trees) * 2.0
-        reward += placement_bonus
-        
-        # Delta fill ratio bonus
+            overlap_ratio = min(collision_area / new_tree_area, 1.0)
+            # Normalized to [-1, 0]: hafif overlap = -0.1, tam overlap = -1.0
+            collision_penalty = -overlap_ratio
+            return collision_penalty  # Collision = immediate return
+
+        # ==================== 2. BASE PLACEMENT BONUS ====================
+        # Ağaç başarıyla yerleşti: +0.1 (sabit, küçük)
+        reward += 0.1
+
+        # ==================== 3. FILL RATIO IMPROVEMENT (Dense Reward) ====================
         if old_bbox_area > 0 and new_bbox_area > 0:
             old_fill = (self.total_tree_area - new_tree_area) / old_bbox_area
             new_fill = self.total_tree_area / new_bbox_area
-            delta_fill = np.clip(new_fill - old_fill, -0.5, 0.5)
-            reward += delta_fill * 10.0
-        
-        # INCREASING expansion penalty: oyun ilerledikçe ceza ARTAR
-        # Başta toleranslı, sonda katı (önce yayıl, sonra kompakt ol)
-        if old_bbox_area > 0:
+
+            # Potential-based shaping: Φ(s') - Φ(s)
+            # Φ(s) = fill_ratio (daha yüksek fill = daha iyi state)
+            fill_improvement = new_fill - old_fill
+
+            # Normalize to [-0.3, 0.3]
+            fill_reward = np.clip(fill_improvement * 3.0, -0.3, 0.3)
+            reward += fill_reward
+
+        # ==================== 4. EXPANSION PENALTY (Progressive) ====================
+        if old_bbox_area > 0 and new_bbox_area > 0:
             expansion = new_bbox_area - old_bbox_area
+
             if expansion > 0:
-                expansion_ratio = expansion / new_tree_area
-                # Progress 0: penalty_mult=0.2 (hafif ceza), Progress 1: penalty_mult=1.0 (tam ceza)
-                penalty_mult = 0.2 + progress * 0.8
-                expansion_penalty = expansion_ratio * penalty_mult * 3.0
-                reward -= min(expansion_penalty, 5.0)
-        
-        # ==================== EPISODE END BONUS ====================
+                # Genişleme oranı (yeni ağaç alanına göre normalize)
+                expansion_ratio = min(expansion / new_tree_area, 2.0)
+
+                # Progress-dependent penalty: başta hafif, sonda ağır
+                # progress=0: mult=0.1, progress=1: mult=0.4
+                penalty_mult = 0.1 + progress * 0.3
+                expansion_penalty = expansion_ratio * penalty_mult
+
+                # Normalize to [-0.3, 0]
+                reward -= min(expansion_penalty, 0.3)
+
+        # ==================== 5. LOCAL DENSITY BONUS ====================
+        # Ağaç mevcut ağaçlara yakın mı? (kompakt yerleşim ödülü)
+        if n_placed >= 2:
+            last_tree = self.placed_trees[-1]
+            min_distance = float('inf')
+
+            for i, tree in enumerate(self.placed_trees[:-1]):
+                dist = last_tree.polygon.distance(tree.polygon)
+                min_distance = min(min_distance, dist)
+
+            # Normalize distance (0 = touching, 1e15 = far)
+            norm = float(scale_factor)
+            normalized_dist = min_distance / norm
+
+            # Yakın yerleşim bonus: 0.1 (touching) -> 0 (far)
+            if normalized_dist < 1.0:  # 1 birim içinde
+                density_bonus = 0.1 * (1.0 - normalized_dist)
+                reward += density_bonus
+
+        # ==================== 6. PROGRESS BONUS (Milestone) ====================
+        # Her %25'lik ilerleme için küçük bonus
+        milestones = [0.25, 0.50, 0.75, 1.0]
+        for milestone in milestones:
+            threshold = int(self.n_trees * milestone)
+            if n_placed == threshold and n_placed > 0:
+                reward += 0.15  # Milestone bonus
+
+        # ==================== 7. EPISODE END BONUS ====================
         if self.current_index >= self.n_trees:
+            # Final bbox size'a göre bonus
             bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
+
             if bbox_size > 0:
-                final_bonus = -np.log(bbox_size + 1e-6) * 5.0
+                # Hedef: Mümkün olan en küçük bbox
+                # fill_ratio > 0.5 ise bonus, < 0.3 ise ceza
+                final_fill = self.fill_ratio
+
+                if final_fill > 0.5:
+                    final_bonus = 0.5  # İyi doluluk
+                elif final_fill > 0.3:
+                    final_bonus = 0.2  # Orta doluluk
+                else:
+                    final_bonus = -0.2  # Kötü doluluk (çok yayılmış)
+
                 reward += final_bonus
-        
+
         return reward
 
     def _update_strtree(self):
@@ -529,39 +586,123 @@ class TreePackingEnvironment(gym.Env):
             tree.polygon.area / (norm ** 2) # area (normalized)
         ], dtype=np.float32)
 
+    def _find_k_nearest_neighbours(self, k: int = 3) -> Dict[int, List[int]]:
+        """
+        Her ağaç için k en yakın komşunun index'lerini döndürür.
+
+        Returns:
+            Dict[int, List[int]]: {tree_idx: [neighbor_idx_1, neighbor_idx_2, ...]}
+        """
+        n = len(self.placed_trees)
+        if n < 2:
+            return {}
+
+        neighbors = {}
+        for i, tree in enumerate(self.placed_trees):
+            distances = []
+            for j, other in enumerate(self.placed_trees):
+                if i != j:
+                    dist = tree.polygon.distance(other.polygon)
+                    distances.append((j, dist))
+
+            # En yakın k komşuyu seç
+            distances.sort(key=lambda x: x[1])
+            neighbors[i] = [idx for idx, _ in distances[:min(k, len(distances))]]
+
+        return neighbors
+
+    def _get_multi_neighbor_pairwise_features(self) -> np.ndarray:
+        """
+        Her ağaç için k=3 en yakın komşu ile pairwise feature'lar.
+        Daha zengin komşuluk bilgisi sağlar.
+
+        Returns:
+            (n_trees, 30) array - her ağaç için 3 komşu * 10 feature
+        """
+        n = len(self.placed_trees)
+        k = self.k_neighbors
+
+        if n < 2:
+            return np.zeros((n, 10 * k), dtype=np.float32)
+
+        neighbors = self._find_k_nearest_neighbours(k)
+        features = np.zeros((n, 10 * k), dtype=np.float32)
+
+        norm = float(scale_factor)
+
+        for i, tree in enumerate(self.placed_trees):
+            neighbor_indices = neighbors.get(i, [])
+
+            for neighbor_rank, neighbor_idx in enumerate(neighbor_indices):
+                if neighbor_rank >= k:
+                    break
+
+                neighbor = self.placed_trees[neighbor_idx]
+
+                # Mesafe
+                distance = tree.polygon.distance(neighbor.polygon)
+
+                # Pair union bounds
+                pair_union = unary_union([tree.polygon, neighbor.polygon])
+                pair_bounds = pair_union.bounds
+                pair_width = pair_bounds[2] - pair_bounds[0]
+                pair_height = pair_bounds[3] - pair_bounds[1]
+
+                # Relative position
+                dx = float(neighbor.center_x - tree.center_x)
+                dy = float(neighbor.center_y - tree.center_y)
+
+                # Her komşu için 10 feature (offset = neighbor_rank * 10)
+                offset = neighbor_rank * 10
+                features[i, offset:offset+10] = np.array([
+                    distance / norm,                    # distance
+                    dx,                                 # relative x
+                    dy,                                 # relative y
+                    pair_bounds[0] / norm,              # pair minx
+                    pair_bounds[1] / norm,              # pair miny
+                    pair_bounds[2] / norm,              # pair maxx
+                    pair_bounds[3] / norm,              # pair maxy
+                    pair_width / norm,                  # pair width
+                    pair_height / norm,                 # pair height
+                    neighbor_idx / self.max_trees       # neighbor index (normalized)
+                ], dtype=np.float32)
+
+        return features
+
     def _get_pairwise_features(self) -> np.ndarray:
         """
         Her ağaç için en yakın komşu ile pairwise feature'lar.
-        
+        (Geriye uyumluluk için korundu)
+
         Returns:
             (n_trees, 10) array
         """
         n = len(self.placed_trees)
         if n < 2:
             return np.zeros((n, 10), dtype=np.float32)
-        
+
         neighbors = find_nearest_neighbours(self.placed_trees)
         features = np.zeros((n, 10), dtype=np.float32)
-        
+
         norm = float(scale_factor)
-        
+
         for i, tree in enumerate(self.placed_trees):
             neighbor_idx = neighbors.get(i, 0)
             neighbor = self.placed_trees[neighbor_idx]
-            
+
             # Mesafe
             distance = tree.polygon.distance(neighbor.polygon)
-            
+
             # Pair union bounds
             pair_union = unary_union([tree.polygon, neighbor.polygon])
             pair_bounds = pair_union.bounds
             pair_width = pair_bounds[2] - pair_bounds[0]
             pair_height = pair_bounds[3] - pair_bounds[1]
-            
+
             # Relative position
             dx = float(neighbor.center_x - tree.center_x)
             dy = float(neighbor.center_y - tree.center_y)
-            
+
             features[i] = np.array([
                 distance / norm,                    # distance
                 dx,                                 # relative x
@@ -574,7 +715,7 @@ class TreePackingEnvironment(gym.Env):
                 pair_height / norm,                 # pair height
                 neighbor_idx / self.max_trees       # neighbor index (normalized)
             ], dtype=np.float32)
-        
+
         return features
 
     def render(self):
