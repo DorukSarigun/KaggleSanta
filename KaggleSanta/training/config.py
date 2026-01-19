@@ -19,6 +19,9 @@ class EnvironmentConfig:
     action_low: List[float] = field(default_factory=lambda: [-10.0, -10.0, 0.0])
     action_high: List[float] = field(default_factory=lambda: [10.0, 10.0, 360.0])
 
+    # Collision handling (YENİ)
+    max_consecutive_collisions: int = 10  # Truncate after this many consecutive collisions
+
 
 @dataclass
 class NetworkConfig:
@@ -26,7 +29,7 @@ class NetworkConfig:
     # Feature dimensions
     tree_feature_dim: int = 10
     pairwise_feature_dim: int = 30       # k=3 neighbors * 10 features
-    scalar_dim: int = 5
+    scalar_dim: int = 8                  # GÜNCELLENDİ: 5 -> 8 (collision tracking)
     free_space_dim: int = 4
 
     # Embedding dimensions
@@ -35,6 +38,7 @@ class NetworkConfig:
     scalar_embed_dim: int = 32
     free_space_embed_dim: int = 32
     grid_embed_dim: int = 64
+    collision_map_embed_dim: int = 64    # YENİ: Collision map embedding
 
     # Transformer architecture
     n_heads: int = 8                     # Number of attention heads

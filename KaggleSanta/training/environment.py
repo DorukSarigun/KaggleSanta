@@ -107,16 +107,25 @@ class TreePackingEnvironment(gym.Env):
         # Observation Space
         # tree_features: Her ağaç için (x, y, angle, minx, miny, maxx, maxy, ...) = 10 dim
         # pairwise_features: Her ağaç için k=3 komşu ile rect özellikleri = 30 dim (10 * 3)
-        # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 5 dim
+        # scalars: Global özellikler (bbox_size, fill_ratio, n_placed, ...) = 8 dim (collision tracking dahil)
         # free_space_features: Boş alan bilgisi = 4 dim [center_x, center_y, area_ratio, n_regions]
+        # collision_map: Binary collision heatmap = (grid_size, grid_size) - NEREYE KOYAMAZ
         self.k_neighbors = 3  # Multi-neighbor için k değeri
+
+        # Collision tracking
+        self.consecutive_collisions = 0
+        self.total_collisions = 0
+        self.max_consecutive_collisions = 10  # Bu kadar üst üste collision = truncate
+        self.last_collision_position = None
+
         self.observation_space = spaces.Dict({
             "tree_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10), dtype=np.float32),
             "pairwise_features": spaces.Box(-np.inf, np.inf, shape=(max_trees, 10 * self.k_neighbors), dtype=np.float32),
-            "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "scalars": spaces.Box(-np.inf, np.inf, shape=(8,), dtype=np.float32),  # 5 -> 8 (collision info)
             "free_space_features": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(max_trees,), dtype=np.float32),
-            "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)
+            "occupancy_grid": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32),
+            "collision_map": spaces.Box(0, 1, shape=(self.grid_size, self.grid_size), dtype=np.float32)  # YENİ
         })
 
     # ==================== PROPERTIES ====================
@@ -168,72 +177,92 @@ class TreePackingEnvironment(gym.Env):
         self.current_index = 0
         self._strtree = None
         self.prev_union_centroid = None
-        
+
+        # Collision tracking reset
+        self.consecutive_collisions = 0
+        self.total_collisions = 0
+        self.last_collision_position = None
+
         observation = self.get_observation()
         info = {
             "n_placed": 0,
             "n_remaining": self.n_trees,
-            "bbox_size": 0.0
+            "bbox_size": 0.0,
+            "total_collisions": 0,
+            "consecutive_collisions": 0
         }
-        
+
         return observation, info
 
     def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
         """
         Bir adım ilerler: Verilen action ile yeni ağaç yerleştirir.
-        
+
+        GÜNCELLEME: Collision tracking ve truncation eklendi.
+
         Args:
             action: (x, y, rotation) array
-            
+
         Returns:
             observation: Yeni state
             reward: Bu adımın ödülü
             terminated: Episode bitti mi (tüm ağaçlar yerleşti)
-            truncated: Kesintiye uğradı mı
+            truncated: Çok fazla collision = kesinti
             info: Ek bilgiler
         """
         x, y, rotation = action[0], action[1], action[2]
-        
+
         # Ağaç boyutunu hesaba katarak sınırları daralt
         margin = 0.5
         x = np.clip(x, margin, 10.0 - margin)
         y = np.clip(y, margin, 10.0 - margin)
         rotation = np.clip(rotation, 0.0, 360.0)
-        
+
         # Mevcut bbox ALANI (reward hesabı için)
         old_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
-        
+
         # Yeni ağaç oluştur
         new_tree = ChristmasTree(
             center_x=str(x),
             center_y=str(y),
             angle=str(rotation)
         )
-        
+
         # Çarpışma kontrolü - şimdi çarpışma alanı döndürüyor
         collision_area = self._check_collision(new_tree)
         has_collision = collision_area > 0
-        
-        if not has_collision:
+
+        if has_collision:
+            # COLLISION TRACKING
+            self.consecutive_collisions += 1
+            self.total_collisions += 1
+            self.last_collision_position = (x, y, rotation)
+            # Ağaç YERLEŞTİRİLMİYOR ama state feedback var
+        else:
             # Geçerli yerleştirme
             self.placed_trees.append(new_tree)
             self.current_index += 1
             self._update_strtree()
-        
+            # Collision streak sıfırla
+            self.consecutive_collisions = 0
+            self.last_collision_position = None
+
         # Yeni bbox ALANI
         new_bbox_area = self.bounding_box_size ** 2 if self.bounding_box_size > 0 else 0
-        
-        # Reward hesapla (alan bazlı)
-        reward = self._calculate_reward(old_bbox_area, new_bbox_area, collision_area)
-        
+
+        # Reward hesapla (GÜÇLENDİRİLMİŞ collision penalty)
+        reward = self._calculate_reward(old_bbox_area, new_bbox_area, collision_area, has_collision)
+
         # Episode bitti mi?
         terminated = self.current_index >= self.n_trees
-        truncated = False
-        
+
+        # TRUNCATION: Çok fazla üst üste collision = episode kes
+        truncated = self.consecutive_collisions >= self.max_consecutive_collisions
+
         # Observation
         observation = self.get_observation()
-        
-        # Info
+
+        # Info (genişletilmiş)
         info = {
             "n_placed": len(self.placed_trees),
             "n_remaining": self.n_trees - self.current_index,
@@ -241,23 +270,29 @@ class TreePackingEnvironment(gym.Env):
             "bbox_area": new_bbox_area,
             "fill_ratio": self.fill_ratio,
             "collision": has_collision,
-            "collision_area": collision_area
+            "collision_area": collision_area,
+            "consecutive_collisions": self.consecutive_collisions,
+            "total_collisions": self.total_collisions,
+            "truncated_by_collision": truncated
         }
-        
+
         return observation, reward, terminated, truncated, info
 
     def get_observation(self) -> Dict[str, np.ndarray]:
         """
         Mevcut state'i observation dictionary olarak döndürür.
 
+        GÜNCELLEME: collision_map ve genişletilmiş scalars eklendi.
+
         Returns:
             Dict containing:
                 - tree_features: (max_trees, 10) her ağacın özellikleri
                 - pairwise_features: (max_trees, 30) k=3 komşu için rect özellikleri
-                - scalars: (5,) global özellikler
+                - scalars: (8,) global özellikler + collision tracking
                 - free_space_features: (4,) boş alan bilgisi
                 - mask: (max_trees,) hangi slotlar dolu
                 - occupancy_grid: (256, 256) doluluk grid'i
+                - collision_map: (256, 256) collision tehlikesi heatmap'i
         """
         n = len(self.placed_trees)
 
@@ -272,17 +307,20 @@ class TreePackingEnvironment(gym.Env):
             pairwise = self._get_multi_neighbor_pairwise_features()
             pairwise_features[:n] = pairwise
 
-        # Scalars: (5,)
-        # Normalize edilmiş değerler
+        # Scalars: (8,) - GENİŞLETİLDİ collision tracking ile
         scalars = np.array([
-            n / self.max_trees,                    # n_placed (normalized)
-            self.bounding_box_size / 1e16,         # bbox_size (normalized by scale)
-            self.fill_ratio,                       # fill_ratio [0-1]
-            (self.n_trees - n) / self.n_trees,     # remaining_ratio [0-1]
-            self.total_tree_area / 1e30            # total_area (normalized)
+            n / self.max_trees,                                    # n_placed (normalized)
+            self.bounding_box_size / 1e16,                         # bbox_size (normalized by scale)
+            self.fill_ratio,                                       # fill_ratio [0-1]
+            (self.n_trees - n) / self.n_trees,                     # remaining_ratio [0-1]
+            self.total_tree_area / 1e30,                           # total_area (normalized)
+            # YENİ: Collision tracking features
+            self.consecutive_collisions / self.max_consecutive_collisions,  # collision_streak [0-1]
+            self.total_collisions / max(self.current_index + self.total_collisions, 1),  # collision_rate [0-1]
+            1.0 if self.last_collision_position else 0.0           # had_collision_last_step
         ], dtype=np.float32)
 
-        # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ (KRİTİK İYİLEŞTİRME)
+        # Free Space Features: (4,) - BOŞ ALAN BİLGİSİ
         free_space_features = self._get_free_space_features()
 
         # Mask: (max_trees,)
@@ -292,17 +330,86 @@ class TreePackingEnvironment(gym.Env):
         # Occupancy Grid: (grid_size, grid_size)
         occupancy_grid = self._get_occupancy_grid()
 
+        # COLLISION MAP: (grid_size, grid_size) - YENİ
+        # Mevcut ağaçların etrafındaki tehlikeli bölgeleri gösterir
+        collision_map = self._get_collision_map()
+
         return {
             "tree_features": tree_features,
             "pairwise_features": pairwise_features,
             "scalars": scalars,
             "free_space_features": free_space_features,
             "mask": mask,
-            "occupancy_grid": occupancy_grid
+            "occupancy_grid": occupancy_grid,
+            "collision_map": collision_map
         }
 
     # ==================== HELPER METHODS ====================
-    
+
+    def _get_collision_map(self) -> np.ndarray:
+        """
+        Collision tehlikesi heatmap'i oluştur.
+        Mevcut ağaçların bulunduğu ve etrafındaki bölgeleri 1 olarak işaretle.
+        Agent bu map'e bakarak nereye yerleştirmemesi gerektiğini öğrenebilir.
+
+        Returns:
+            (grid_size, grid_size) binary collision map
+        """
+        collision_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+
+        if not self.placed_trees:
+            return collision_map
+
+        try:
+            from rasterio.features import rasterize
+            from rasterio.transform import from_bounds
+            from shapely.geometry import box
+
+            norm = float(scale_factor)
+            minx = -10.0 * norm
+            miny = -10.0 * norm
+            maxx = 10.0 * norm
+            maxy = 10.0 * norm
+
+            transform = from_bounds(minx, miny, maxx, maxy, self.grid_size, self.grid_size)
+
+            # Her ağacın buffer'lı versiyonunu oluştur (collision margin)
+            # Buffer = ağaç boyutunun yaklaşık yarısı
+            buffer_distance = 0.4 * norm  # 0.4 birim buffer
+
+            buffered_shapes = []
+            for tree in self.placed_trees:
+                # Ağacın kendisi (kesin collision)
+                buffered_shapes.append((tree.polygon, 1.0))
+                # Ağacın etrafı (tehlikeli bölge) - daha düşük değer
+                try:
+                    buffered = tree.polygon.buffer(buffer_distance)
+                    buffered_shapes.append((buffered, 0.5))
+                except:
+                    pass
+
+            # Rasterize - önce buffer'lı, sonra kesin collision üzerine
+            collision_map = rasterize(
+                buffered_shapes,
+                out_shape=(self.grid_size, self.grid_size),
+                transform=transform,
+                fill=0.0,
+                dtype=np.float32,
+                merge_alg='ADD'  # Üst üste binen bölgeler toplanır
+            )
+
+            # Normalize to [0, 1]
+            collision_map = np.clip(collision_map, 0, 1)
+
+            # Y ekseni ters çevir
+            collision_map = np.flipud(collision_map).copy()
+
+        except ImportError:
+            # Fallback: occupancy grid'i collision map olarak kullan
+            collision_map = (self._get_occupancy_grid() > 0.1).astype(np.float32)
+
+        return collision_map
+
     def _get_occupancy_grid(self) -> np.ndarray:
         """
         256x256 occupancy grid oluştur - Her hücre doluluk ORANI (0-1).
@@ -439,52 +546,70 @@ class TreePackingEnvironment(gym.Env):
         return total_intersection_area
 
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
-                         collision_area: float) -> float:
+                         collision_area: float, has_collision: bool = False) -> float:
         """
-        İYİLEŞTİRİLMİŞ Reward Fonksiyonu - Balanced & Dense.
+        GÜÇLENDİRİLMİŞ Reward Fonksiyonu - Collision Learning Odaklı.
 
-        Değişiklikler:
-        1. Tüm bileşenler [-1, 1] aralığına normalize edildi
-        2. Dense intermediate rewards eklendi
-        3. Local density bonus eklendi
-        4. Potential-based shaping uygulandı
-        5. Exploration bonusu eklendi
+        MAJOR DEĞİŞİKLİKLER:
+        1. Collision penalty BÜYÜK ARTIRILDI (-1 -> -5 base, -10 max)
+        2. Consecutive collision penalty eklendi
+        3. Başarılı yerleşim bonusu artırıldı
+        4. Collision-free streak bonus eklendi
         """
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
 
-        # Yeni ağacın alanı (referans)
+        # Yeni ağacın alanı (referans için varsayılan değer)
+        # Collision durumunda placed_trees güncellenmediği için default kullan
         if self.placed_trees:
             new_tree_area = self.placed_trees[-1].polygon.area
         else:
-            new_tree_area = norm_sq * 0.01
+            new_tree_area = norm_sq * 0.01  # Default tree area
 
         # Progress ratio (0 = başlangıç, 1 = bitti)
         progress = self.current_index / max(self.n_trees, 1)
         n_placed = len(self.placed_trees)
 
-        # ==================== 1. COLLISION PENALTY (Normalized) ====================
-        if collision_area > 0:
-            overlap_ratio = min(collision_area / new_tree_area, 1.0)
-            # Normalized to [-1, 0]: hafif overlap = -0.1, tam overlap = -1.0
-            collision_penalty = -overlap_ratio
-            return collision_penalty  # Collision = immediate return
+        # ==================== 1. COLLISION PENALTY (GÜÇLENDİRİLMİŞ) ====================
+        if has_collision or collision_area > 0:
+            # Base collision penalty: -5 (eskiden -1)
+            base_penalty = -5.0
 
-        # ==================== 2. BASE PLACEMENT BONUS ====================
-        # Ağaç başarıyla yerleşti: +0.1 (sabit, küçük)
-        reward += 0.1
+            # Overlap ratio'ya göre ek ceza
+            if collision_area > 0 and new_tree_area > 0:
+                overlap_ratio = min(collision_area / new_tree_area, 1.0)
+                overlap_penalty = -3.0 * overlap_ratio  # -0 to -3
+            else:
+                overlap_penalty = -1.0  # Minimum overlap penalty
+
+            # CONSECUTIVE COLLISION PENALTY: Üst üste collision = artan ceza
+            # 1. collision: -0, 2. collision: -1, 3. collision: -2, ...
+            consecutive_penalty = -1.0 * min(self.consecutive_collisions, 5)
+
+            # TOTAL PENALTY: -5 to -13 arası
+            total_collision_penalty = base_penalty + overlap_penalty + consecutive_penalty
+
+            # Cap at -10 to avoid extreme values
+            return max(total_collision_penalty, -10.0)
+
+        # ==================== 2. BAŞARILI YERLEŞİM BONUSU (ARTIRILDI) ====================
+        # Collision olmadan yerleştirme: +1.0 (eskiden +0.1)
+        reward += 1.0
+
+        # Collision-free streak bonus: Üst üste başarılı yerleşim
+        # (consecutive_collisions = 0 olduğunda hesaplanır)
+        if self.total_collisions == 0:
+            # Hiç collision yapmadan ilerleme = ekstra bonus
+            no_collision_bonus = 0.2 * progress
+            reward += no_collision_bonus
 
         # ==================== 3. FILL RATIO IMPROVEMENT (Dense Reward) ====================
         if old_bbox_area > 0 and new_bbox_area > 0:
             old_fill = (self.total_tree_area - new_tree_area) / old_bbox_area
             new_fill = self.total_tree_area / new_bbox_area
 
-            # Potential-based shaping: Φ(s') - Φ(s)
-            # Φ(s) = fill_ratio (daha yüksek fill = daha iyi state)
             fill_improvement = new_fill - old_fill
-
-            # Normalize to [-0.3, 0.3]
-            fill_reward = np.clip(fill_improvement * 3.0, -0.3, 0.3)
+            fill_reward = np.clip(fill_improvement * 5.0, -0.5, 0.5)  # Artırıldı
             reward += fill_reward
 
         # ==================== 4. EXPANSION PENALTY (Progressive) ====================
@@ -492,19 +617,12 @@ class TreePackingEnvironment(gym.Env):
             expansion = new_bbox_area - old_bbox_area
 
             if expansion > 0:
-                # Genişleme oranı (yeni ağaç alanına göre normalize)
                 expansion_ratio = min(expansion / new_tree_area, 2.0)
-
-                # Progress-dependent penalty: başta hafif, sonda ağır
-                # progress=0: mult=0.1, progress=1: mult=0.4
-                penalty_mult = 0.1 + progress * 0.3
+                penalty_mult = 0.1 + progress * 0.4
                 expansion_penalty = expansion_ratio * penalty_mult
-
-                # Normalize to [-0.3, 0]
-                reward -= min(expansion_penalty, 0.3)
+                reward -= min(expansion_penalty, 0.5)
 
         # ==================== 5. LOCAL DENSITY BONUS ====================
-        # Ağaç mevcut ağaçlara yakın mı? (kompakt yerleşim ödülü)
         if n_placed >= 2:
             last_tree = self.placed_trees[-1]
             min_distance = float('inf')
@@ -513,39 +631,44 @@ class TreePackingEnvironment(gym.Env):
                 dist = last_tree.polygon.distance(tree.polygon)
                 min_distance = min(min_distance, dist)
 
-            # Normalize distance (0 = touching, 1e15 = far)
             norm = float(scale_factor)
             normalized_dist = min_distance / norm
 
-            # Yakın yerleşim bonus: 0.1 (touching) -> 0 (far)
-            if normalized_dist < 1.0:  # 1 birim içinde
+            # Touching bonus artırıldı
+            if normalized_dist < 0.5:  # Çok yakın
+                density_bonus = 0.3 * (1.0 - normalized_dist * 2)
+                reward += density_bonus
+            elif normalized_dist < 1.0:
                 density_bonus = 0.1 * (1.0 - normalized_dist)
                 reward += density_bonus
 
         # ==================== 6. PROGRESS BONUS (Milestone) ====================
-        # Her %25'lik ilerleme için küçük bonus
         milestones = [0.25, 0.50, 0.75, 1.0]
         for milestone in milestones:
             threshold = int(self.n_trees * milestone)
             if n_placed == threshold and n_placed > 0:
-                reward += 0.15  # Milestone bonus
+                reward += 0.25  # Artırıldı
 
         # ==================== 7. EPISODE END BONUS ====================
         if self.current_index >= self.n_trees:
-            # Final bbox size'a göre bonus
             bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
 
             if bbox_size > 0:
-                # Hedef: Mümkün olan en küçük bbox
-                # fill_ratio > 0.5 ise bonus, < 0.3 ise ceza
                 final_fill = self.fill_ratio
 
+                # Fill ratio bazlı final bonus (artırıldı)
                 if final_fill > 0.5:
-                    final_bonus = 0.5  # İyi doluluk
+                    final_bonus = 2.0
+                elif final_fill > 0.4:
+                    final_bonus = 1.0
                 elif final_fill > 0.3:
-                    final_bonus = 0.2  # Orta doluluk
+                    final_bonus = 0.5
                 else:
-                    final_bonus = -0.2  # Kötü doluluk (çok yayılmış)
+                    final_bonus = -1.0
+
+                # Collision-free completion bonus
+                if self.total_collisions == 0:
+                    final_bonus += 1.0  # Perfect run bonus
 
                 reward += final_bonus
 
