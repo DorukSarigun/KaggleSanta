@@ -11,60 +11,158 @@ import math
 from typing import Tuple, Optional
 
 
-class DirectSpatialEncoding(nn.Module):
+class AbsoluteSpatialEncoding(nn.Module):
     """
-    Direct spatial encoding from raw tree coordinates.
-    No MLP TreeEncoder - uses Fourier features from ALL coordinates.
+    Fourier encoding for ABSOLUTE tree coordinates only.
     
     Input: (batch, n_trees, 33) = center(2) + rotation(1) + 15 corners × 2(30)
     Output: (batch, n_trees, d_model)
     """
     
-    def __init__(self, d_model: int = 128, n_freqs: int = 8):
+    def __init__(self, d_model: int = 96, n_freqs: int = 8, abs_dim: int = 33):
         super().__init__()
         self.d_model = d_model
         self.n_freqs = n_freqs
         
         # 33 coordinates × 2 (sin+cos) × n_freqs frequencies
-        fourier_dim = 33 * 2 * n_freqs  # 33 * 2 * 8 = 528
+        fourier_dim = abs_dim * 2 * n_freqs  # 33 * 2 * 8 = 528
         
         # Project Fourier features to d_model
         self.projection = nn.Linear(fourier_dim, d_model)
         
         # Frequency bands (log-spaced)
-        freqs = 2.0 ** torch.linspace(0, n_freqs - 1, n_freqs)  # [1, 2, 4, 8, 16, 32, 64, 128]
+        freqs = 2.0 ** torch.linspace(0, n_freqs - 1, n_freqs)
         self.register_buffer('freqs', freqs * math.pi)
+    
+    def forward(self, abs_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            abs_features: (batch, n_trees, 33) - absolute coords
+        Returns:
+            (batch, n_trees, d_model)
+        """
+        batch_size, n_trees, _ = abs_features.shape
+        
+        x = abs_features.unsqueeze(-1) * self.freqs
+        fourier = torch.stack([torch.sin(x), torch.cos(x)], dim=-1)
+        fourier = fourier.reshape(batch_size, n_trees, -1)
+        
+        return self.projection(fourier)
+
+
+class HybridRelativeEncoding(nn.Module):
+    """
+    Hybrid encoding for RELATIVE features with separate Polar and Cartesian branches.
+    
+    Input: (batch, n_trees, 6) = [dx, dy, dist, angle, dx_bbox, dy_bbox]
+    - Cartesian: dx, dy, dx_bbox, dy_bbox (4 features)
+    - Polar: dist, angle (2 features)
+    
+    Output: (batch, n_trees, d_model)
+    """
+    
+    def __init__(self, d_model: int = 32, n_freqs: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.n_freqs = n_freqs
+        
+        # Cartesian branch: dx, dy, dx_bbox, dy_bbox (4 features)
+        cartesian_fourier_dim = 4 * 2 * n_freqs  # 4 * 2 * 8 = 64
+        self.cartesian_proj = nn.Linear(cartesian_fourier_dim, d_model // 2)
+        
+        # Polar branch: dist, angle (2 features) - higher frequencies for fine detail
+        polar_fourier_dim = 2 * 2 * n_freqs  # 2 * 2 * 8 = 32
+        self.polar_proj = nn.Linear(polar_fourier_dim, d_model // 2)
+        
+        # Frequency bands - standard for Cartesian
+        freqs = 2.0 ** torch.linspace(0, n_freqs - 1, n_freqs)
+        self.register_buffer('cart_freqs', freqs * math.pi)
+        
+        # Higher frequencies for Polar (fine-grained distance/angle)
+        polar_freqs = 2.0 ** torch.linspace(1, n_freqs, n_freqs)  # [2, 4, ..., 256]
+        self.register_buffer('polar_freqs', polar_freqs * math.pi)
+    
+    def forward(self, rel_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            rel_features: (batch, n_trees, 6) - [dx, dy, dist, angle, dx_bbox, dy_bbox]
+        Returns:
+            (batch, n_trees, d_model)
+        """
+        batch_size, n_trees, _ = rel_features.shape
+        
+        # Split features
+        dx, dy = rel_features[..., 0:1], rel_features[..., 1:2]
+        dist, angle = rel_features[..., 2:3], rel_features[..., 3:4]
+        dx_bbox, dy_bbox = rel_features[..., 4:5], rel_features[..., 5:6]
+        
+        # Cartesian features: (batch, n_trees, 4)
+        cartesian = torch.cat([dx, dy, dx_bbox, dy_bbox], dim=-1)
+        
+        # Polar features: (batch, n_trees, 2)
+        polar = torch.cat([dist, angle], dim=-1)
+        
+        # Fourier encode Cartesian
+        cart_x = cartesian.unsqueeze(-1) * self.cart_freqs
+        cart_fourier = torch.stack([torch.sin(cart_x), torch.cos(cart_x)], dim=-1)
+        cart_fourier = cart_fourier.reshape(batch_size, n_trees, -1)
+        cart_embed = self.cartesian_proj(cart_fourier)
+        
+        # Fourier encode Polar (higher frequencies)
+        polar_x = polar.unsqueeze(-1) * self.polar_freqs
+        polar_fourier = torch.stack([torch.sin(polar_x), torch.cos(polar_x)], dim=-1)
+        polar_fourier = polar_fourier.reshape(batch_size, n_trees, -1)
+        polar_embed = self.polar_proj(polar_fourier)
+        
+        # Concatenate: (batch, n_trees, d_model)
+        return torch.cat([cart_embed, polar_embed], dim=-1)
+
+
+class CombinedTreeEncoder(nn.Module):
+    """
+    Combines AbsoluteSpatialEncoding + HybridRelativeEncoding.
+    
+    Input: (batch, n_trees, 39) = absolute(33) + relative(6)
+    Output: (batch, n_trees, embed_dim)
+    """
+    
+    def __init__(self, embed_dim: int = 128, n_freqs: int = 8):
+        super().__init__()
+        
+        # Absolute branch: 33 features → 96D
+        self.absolute_encoder = AbsoluteSpatialEncoding(d_model=96, n_freqs=n_freqs, abs_dim=33)
+        
+        # Relative branch: 6 features → 32D (Polar + Cartesian)
+        self.relative_encoder = HybridRelativeEncoding(d_model=32, n_freqs=n_freqs)
+        
+        # Fusion: 96 + 32 = 128 → embed_dim
+        self.fusion = nn.Linear(128, embed_dim)
     
     def forward(self, tree_features: torch.Tensor) -> torch.Tensor:
         """
-        Encode tree coordinates directly using Fourier features.
-        
         Args:
-            tree_features: (batch, n_trees, 33) - all coordinates normalized [0,1]
+            tree_features: (batch, n_trees, 39)
         Returns:
-            (batch, n_trees, d_model) - spatial embeddings
+            (batch, n_trees, embed_dim)
         """
-        batch_size, n_trees, n_coords = tree_features.shape
+        # Split absolute (first 33) and relative (last 6)
+        abs_features = tree_features[..., :33]
+        rel_features = tree_features[..., 33:]
         
-        # Expand for frequencies: (batch, n_trees, 33, n_freqs)
-        x = tree_features.unsqueeze(-1) * self.freqs
+        # Encode separately
+        abs_embed = self.absolute_encoder(abs_features)  # (batch, n_trees, 96)
+        rel_embed = self.relative_encoder(rel_features)  # (batch, n_trees, 32)
         
-        # Sin and cos: (batch, n_trees, 33, n_freqs, 2)
-        fourier = torch.stack([torch.sin(x), torch.cos(x)], dim=-1)
+        # Fuse
+        combined = torch.cat([abs_embed, rel_embed], dim=-1)  # (batch, n_trees, 128)
         
-        # Flatten: (batch, n_trees, 33 * n_freqs * 2)
-        fourier = fourier.reshape(batch_size, n_trees, -1)
-        
-        # Project to d_model
-        embeddings = self.projection(fourier)
-        
-        return embeddings
+        return self.fusion(combined)  # (batch, n_trees, embed_dim)
 
 
 class TreeEncoder(nn.Module):
     """Simple linear projection for backward compatibility."""
     
-    def __init__(self, tree_dim: int = 33, embed_dim: int = 128):
+    def __init__(self, tree_dim: int = 39, embed_dim: int = 128):
         super().__init__()
         self.encoder = nn.Linear(tree_dim, embed_dim)
     
@@ -72,42 +170,129 @@ class TreeEncoder(nn.Module):
         return self.encoder(tree_features)
 
 
+class SpatialContextEncoder(nn.Module):
+    """
+    Encode spatial context (bbox) using Fourier features.
+    Same approach as DirectSpatialEncoding for trees.
+    
+    Input: bbox(4) = [minx, miny, maxx, maxy]
+    Output: (batch, embed_dim)
+    """
+    
+    def __init__(self, input_dim: int = 4, embed_dim: int = 64, n_freqs: int = 8):
+        super().__init__()
+        self.n_freqs = n_freqs
+        
+        # 4 coordinates × 2 (sin+cos) × n_freqs = 64 dim
+        fourier_dim = input_dim * 2 * n_freqs
+        
+        self.projection = nn.Sequential(
+            nn.Linear(fourier_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        
+        # Frequency bands (log-spaced)
+        freqs = 2.0 ** torch.linspace(0, n_freqs - 1, n_freqs)
+        self.register_buffer('freqs', freqs * math.pi)
+    
+    def forward(self, bbox: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            bbox: (batch, 4) - [minx, miny, maxx, maxy]
+        Returns:
+            (batch, embed_dim) - spatial context embedding
+        """
+        # Expand for frequencies: (batch, 4, n_freqs)
+        x = bbox.unsqueeze(-1) * self.freqs
+        
+        # Sin and cos: (batch, 4, n_freqs, 2)
+        fourier = torch.stack([torch.sin(x), torch.cos(x)], dim=-1)
+        
+        # Flatten: (batch, 4 * n_freqs * 2)
+        fourier = fourier.reshape(bbox.shape[0], -1)
+        
+        return self.projection(fourier)
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with BatchNorm for CNN."""
+    
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 2):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # Skip connection (1x1 conv if dimensions change)
+        if stride != 1 or in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.skip = nn.Identity()
+        
+        self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.skip(x)
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out = out + identity  # Residual connection
+        out = self.relu(out)
+        return out
+
+
 class GridEncoder(nn.Module):
-    """CNN encoder for 256x256 occupancy grid."""
+    """CNN encoder for 512x512 occupancy grid with BatchNorm and Residual connections."""
     
     def __init__(self, embed_dim: int = 128):
         super().__init__()
         
-        # CNN: 256 -> 128 -> 64 -> 32 -> 16 -> 8
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),  # 256 -> 128
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # 128 -> 64
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 64 -> 32
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 32 -> 16
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),  # 16 -> 8
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)  # 8 -> 1
+        # Initial conv: 512 -> 256
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=7, stride=2, padding=3),  # 512 -> 256
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
         )
         
+        # Residual blocks with BatchNorm
+        self.layer1 = ResidualBlock(32, 64, stride=2)    # 256 -> 128
+        self.layer2 = ResidualBlock(64, 128, stride=2)   # 128 -> 64
+        self.layer3 = ResidualBlock(128, 128, stride=2)  # 64 -> 32
+        self.layer4 = ResidualBlock(128, 128, stride=2)  # 32 -> 16
+        self.layer5 = ResidualBlock(128, 128, stride=2)  # 16 -> 8
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)  # 8 -> 1
         self.fc = nn.Linear(128, embed_dim)
     
     def forward(self, grid: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            grid: (batch, 256, 256) or (batch, 1, 256, 256)
+            grid: (batch, 512, 512) or (batch, 1, 512, 512)
         Returns:
             (batch, embed_dim)
         """
         if grid.dim() == 3:
             grid = grid.unsqueeze(1)  # Add channel dim
         
-        x = self.cnn(grid)  # (batch, 128, 1, 1)
-        x = x.flatten(1)    # (batch, 128)
-        return self.fc(x)   # (batch, embed_dim)
+        x = self.conv1(grid)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        return self.fc(x)
 
 
 class CrossAttentionFusion(nn.Module):
@@ -205,7 +390,7 @@ class TransformerActorCritic(nn.Module):
     
     def __init__(
         self,
-        tree_dim: int = 33,          # FULL: center (2) + rot (1) + 15 corners × 2 = 33
+        tree_dim: int = 39,          # FULL: center (2) + rot (1) + 15 corners × 2 (30) + relative (6) = 39
         scalar_dim: int = 5,         # Global scalar features
         embed_dim: int = 128,        # Transformer embedding dim
         n_heads: int = 8,            # Number of attention heads
@@ -228,8 +413,8 @@ class TransformerActorCritic(nn.Module):
         self.register_buffer('action_scale', (self.action_high - self.action_low) / 2)
         self.register_buffer('action_bias', (self.action_high + self.action_low) / 2)
         
-        # Direct spatial encoding from all coordinates (no TreeEncoder MLP)
-        self.spatial_encoder = DirectSpatialEncoding(embed_dim, n_freqs=8)
+        # Combined encoder: Absolute (33D) + Hybrid Relative (6D with Polar+Cartesian)
+        self.spatial_encoder = CombinedTreeEncoder(embed_dim, n_freqs=8)
         
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -251,11 +436,14 @@ class TransformerActorCritic(nn.Module):
         # Grid encoder (CNN for occupancy grid)
         self.grid_encoder = GridEncoder(embed_dim)
         
-        # Cross-attention fusion (replaces concat)
+        # Spatial context encoder (bbox = 4 dim -> 64 dim with Fourier features)
+        self.spatial_context_encoder = SpatialContextEncoder(input_dim=4, embed_dim=64, n_freqs=8)
+        
+        # Cross-attention fusion
         self.fusion = CrossAttentionFusion(embed_dim, n_heads=4)
         
-        # State dim after fusion (single embed_dim, not 3*embed_dim)
-        state_dim = embed_dim
+        # State dim after fusion + spatial_context
+        state_dim = embed_dim + 64
         
         # Actor head
         self.actor_mean = nn.Sequential(
@@ -339,7 +527,8 @@ class TransformerActorCritic(nn.Module):
         tree_features: torch.Tensor,
         scalars: torch.Tensor,
         mask: torch.Tensor = None,
-        grid: torch.Tensor = None
+        grid: torch.Tensor = None,
+        bbox: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
@@ -348,7 +537,8 @@ class TransformerActorCritic(nn.Module):
             tree_features: (batch, n_trees, tree_dim)
             scalars: (batch, scalar_dim)
             mask: (batch, n_trees) - True for valid trees
-            grid: (batch, 256, 256) - occupancy grid
+            grid: (batch, 512, 512) - occupancy grid
+            bbox: (batch, 4) - bounding box coords [minx, miny, maxx, maxy]
         
         Returns:
             mean, log_std, value
@@ -374,7 +564,20 @@ class TransformerActorCritic(nn.Module):
             grid_embed = torch.zeros_like(scalar_embed)
         
         # Cross-attention fusion: scalar+grid query attends to tree sequence
-        state = self.fusion(tree_seq, scalar_embed, grid_embed, mask)  # (batch, embed_dim)
+        fusion_out = self.fusion(tree_seq, scalar_embed, grid_embed, mask)  # (batch, embed_dim)
+        
+        # Encode bbox spatial context (only bbox now, no free_space)
+        batch_size = tree_features.shape[0]
+        device = tree_features.device
+        
+        if bbox is None:
+            bbox = torch.zeros(batch_size, 4, device=device)
+        
+        # Fourier encoding for bbox only (4 dim)
+        context_embed = self.spatial_context_encoder(bbox)  # (batch, 64)
+        
+        # Concat fusion output with spatial context embedding
+        state = torch.cat([fusion_out, context_embed], dim=-1)  # (batch, embed_dim + 64)
         
         # Handle NaN in state
         state = torch.nan_to_num(state, nan=0.0)
@@ -397,11 +600,12 @@ class TransformerActorCritic(nn.Module):
         scalars: torch.Tensor,
         mask: torch.Tensor = None,
         grid: torch.Tensor = None,
+        bbox: torch.Tensor = None,
         deterministic: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample action from policy."""
         
-        mean, log_std, value = self.forward(tree_features, scalars, mask, grid)
+        mean, log_std, value = self.forward(tree_features, scalars, mask, grid, bbox)
         
         # Handle NaN
         log_std = torch.nan_to_num(log_std, nan=-2.0)
@@ -428,11 +632,12 @@ class TransformerActorCritic(nn.Module):
         scalars: torch.Tensor,
         actions: torch.Tensor,
         mask: torch.Tensor = None,
-        grid: torch.Tensor = None
+        grid: torch.Tensor = None,
+        bbox: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate actions for PPO update."""
         
-        mean, log_std, value = self.forward(tree_features, scalars, mask, grid)
+        mean, log_std, value = self.forward(tree_features, scalars, mask, grid, bbox)
         
         # Handle NaN in log_std before exp
         log_std = torch.nan_to_num(log_std, nan=-2.0)  # Default to std~0.13

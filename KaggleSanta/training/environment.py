@@ -226,8 +226,8 @@ class TreePackingEnvironment(gym.Env):
         # Reward hesapla (alan bazlı)
         reward = self._calculate_reward(old_bbox_area, new_bbox_area, collision_area)
         
-        # Episode bitti mi?
-        terminated = self.current_index >= self.n_trees
+        # Episode bitti mi? (Collision olursa da biter!)
+        terminated = self.current_index >= self.n_trees or has_collision
         truncated = False
         
         # Observation
@@ -303,13 +303,19 @@ class TreePackingEnvironment(gym.Env):
 
     # ==================== HELPER METHODS ====================
     
-    def _get_occupancy_grid(self) -> np.ndarray:
+    def _get_occupancy_grid(self, size: int = None) -> np.ndarray:
         """
-        256x256 occupancy grid oluştur - Her hücre doluluk ORANI (0-1).
+        NxN occupancy grid oluştur - Her hücre doluluk ORANI (0-1).
         Yüksek çözünürlükte rasterize edip downsample yaparak fill ratio hesaplar.
         Grid her zaman [-10, 10] x [-10, 10] alanını kapsar.
+        
+        Args:
+            size: Grid size (default: self.grid_size = 256)
         """
-        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        if size is None:
+            size = self.grid_size
+            
+        grid = np.zeros((size, size), dtype=np.float32)
         
         if not self.placed_trees:
             return grid
@@ -326,7 +332,7 @@ class TreePackingEnvironment(gym.Env):
             maxy = 10.0 * norm
             
             # Yüksek çözünürlükte rasterize (4x) - fill ratio için
-            high_res = self.grid_size * 4  # 1024x1024
+            high_res = size * 4
             transform = from_bounds(minx, miny, maxx, maxy, high_res, high_res)
             
             shapes = [(tree.polygon, 1.0) for tree in self.placed_trees]
@@ -342,9 +348,8 @@ class TreePackingEnvironment(gym.Env):
             )
             
             # Downsample: 4x4 blokların ortalaması = fill ratio
-            # Reshape to (256, 4, 256, 4) then mean over axes (1, 3)
             grid = high_res_grid.reshape(
-                self.grid_size, 4, self.grid_size, 4
+                size, 4, size, 4
             ).mean(axis=(1, 3))
             
             # Y ekseni ters çevir + contiguous memory
@@ -444,11 +449,7 @@ class TreePackingEnvironment(gym.Env):
         İYİLEŞTİRİLMİŞ Reward Fonksiyonu - Balanced & Dense.
 
         Değişiklikler:
-        1. Tüm bileşenler [-1, 1] aralığına normalize edildi
-        2. Dense intermediate rewards eklendi
-        3. Local density bonus eklendi
-        4. Potential-based shaping uygulandı
-        5. Exploration bonusu eklendi
+        SIMPLIFIED: Sadece Kaggle metriği ve collision penalty.
         """
         reward = 0.0
         norm_sq = float(scale_factor) ** 2
@@ -463,91 +464,82 @@ class TreePackingEnvironment(gym.Env):
         progress = self.current_index / max(self.n_trees, 1)
         n_placed = len(self.placed_trees)
 
-        # ==================== 1. COLLISION PENALTY (Normalized) ====================
+        # ==================== 1. COLLISION PENALTY (Ağır) ====================
         if collision_area > 0:
-            overlap_ratio = min(collision_area / new_tree_area, 1.0)
-            # Normalized to [-1, 0]: hafif overlap = -0.1, tam overlap = -1.0
-            collision_penalty = -overlap_ratio
-            return collision_penalty  # Collision = immediate return
+            collision_penalty = -20.0  # Sabit ağır ceza
+            return collision_penalty
 
-        # ==================== 2. BASE PLACEMENT BONUS ====================
-        # Ağaç başarıyla yerleşti: +0.1 (sabit, küçük)
-        reward += 0.1
+        # ==================== 2. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
+        # Her başarılı yerleşim = +1 bonus
+        reward = 1.0  # Base placement bonus
+        
+        # Kaggle score = s² / n where s = max(width, height)
+        # Lower is better -> improvement = old - new
+        if old_bbox_area > 0 and new_bbox_area > 0 and n_placed > 0:
+            # Old Kaggle score (before this tree)
+            old_bbox_size = np.sqrt(old_bbox_area) / float(scale_factor)
+            old_kaggle = (old_bbox_size ** 2) / max(n_placed - 1, 1) if n_placed > 1 else 0
+            
+            # New Kaggle score (after this tree)
+            new_bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
+            new_kaggle = (new_bbox_size ** 2) / n_placed
+            
+            # Improvement: old - new (positive = good)
+            kaggle_improvement = old_kaggle - new_kaggle
+            
+            # Add Kaggle improvement to placement bonus
+            reward += kaggle_improvement
 
-        # ==================== 3. FILL RATIO IMPROVEMENT (Dense Reward) ====================
-        if old_bbox_area > 0 and new_bbox_area > 0:
-            old_fill = (self.total_tree_area - new_tree_area) / old_bbox_area
-            new_fill = self.total_tree_area / new_bbox_area
-
-            # Potential-based shaping: Φ(s') - Φ(s)
-            # Φ(s) = fill_ratio (daha yüksek fill = daha iyi state)
-            fill_improvement = new_fill - old_fill
-
-            # Normalize to [-0.3, 0.3]
-            fill_reward = np.clip(fill_improvement * 3.0, -0.3, 0.3)
-            reward += fill_reward
-
-        # ==================== 4. EXPANSION PENALTY (Progressive) ====================
-        if old_bbox_area > 0 and new_bbox_area > 0:
-            expansion = new_bbox_area - old_bbox_area
-
-            if expansion > 0:
-                # Genişleme oranı (yeni ağaç alanına göre normalize)
-                expansion_ratio = min(expansion / new_tree_area, 2.0)
-
-                # Progress-dependent penalty: başta hafif, sonda ağır
-                # progress=0: mult=0.1, progress=1: mult=0.4
-                penalty_mult = 0.1 + progress * 0.3
-                expansion_penalty = expansion_ratio * penalty_mult
-
-                # Normalize to [-0.3, 0]
-                reward -= min(expansion_penalty, 0.3)
-
-        # ==================== 5. LOCAL DENSITY BONUS ====================
-        # Ağaç mevcut ağaçlara yakın mı? (kompakt yerleşim ödülü)
-        if n_placed >= 2:
-            last_tree = self.placed_trees[-1]
-            min_distance = float('inf')
-
-            for i, tree in enumerate(self.placed_trees[:-1]):
-                dist = last_tree.polygon.distance(tree.polygon)
-                min_distance = min(min_distance, dist)
-
-            # Normalize distance (0 = touching, 1e15 = far)
-            norm = float(scale_factor)
-            normalized_dist = min_distance / norm
-
-            # Yakın yerleşim bonus: 0.1 (touching) -> 0 (far)
-            if normalized_dist < 1.0:  # 1 birim içinde
-                density_bonus = 0.1 * (1.0 - normalized_dist)
-                reward += density_bonus
-
-        # ==================== 6. PROGRESS BONUS (Milestone) ====================
-        # Her %25'lik ilerleme için küçük bonus
-        milestones = [0.25, 0.50, 0.75, 1.0]
-        for milestone in milestones:
-            threshold = int(self.n_trees * milestone)
-            if n_placed == threshold and n_placed > 0:
-                reward += 0.15  # Milestone bonus
-
-        # ==================== 7. EPISODE END BONUS ====================
-        if self.current_index >= self.n_trees:
-            # Final bbox size'a göre bonus
-            bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
-
-            if bbox_size > 0:
-                # Hedef: Mümkün olan en küçük bbox
-                # fill_ratio > 0.5 ise bonus, < 0.3 ise ceza
-                final_fill = self.fill_ratio
-
-                if final_fill > 0.5:
-                    final_bonus = 0.5  # İyi doluluk
-                elif final_fill > 0.3:
-                    final_bonus = 0.2  # Orta doluluk
-                else:
-                    final_bonus = -0.2  # Kötü doluluk (çok yayılmış)
-
-                reward += final_bonus
+        # ==================== COMMENTED OUT (for future use) ====================
+        # 
+        # # 2. BASE PLACEMENT BONUS
+        # reward += 0.1
+        #
+        # # 4. EXPANSION PENALTY (Progressive)
+        # if old_bbox_area > 0 and new_bbox_area > 0:
+        #     expansion = new_bbox_area - old_bbox_area
+        #     if expansion > 0:
+        #         expansion_ratio = expansion / old_bbox_area
+        #         penalty_mult = 0.05 + progress * 0.1
+        #         expansion_penalty = expansion_ratio * penalty_mult
+        #         reward -= min(expansion_penalty, 0.15)
+        #
+        # # 5. LOCAL DENSITY BONUS
+        # if n_placed >= 2:
+        #     last_tree = self.placed_trees[-1]
+        #     min_distance = float('inf')
+        #     for tree in self.placed_trees[:-1]:
+        #         dist = last_tree.polygon.distance(tree.polygon)
+        #         min_distance = min(min_distance, dist)
+        #     norm = float(scale_factor)
+        #     normalized_dist = min_distance / norm
+        #     if normalized_dist < 1.0:
+        #         density_bonus = 0.1 * (1.0 - normalized_dist)
+        #         reward += density_bonus
+        #
+        # # 6. PROGRESS BONUS (Milestone)
+        # milestones = [0.25, 0.50, 0.75, 1.0]
+        # for milestone in milestones:
+        #     threshold = int(self.n_trees * milestone)
+        #     if n_placed == threshold and n_placed > 0:
+        #         reward += 0.15
+        #
+        # # 7. EPISODE END BONUS
+        # if self.current_index >= self.n_trees:
+        #     bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
+        #     if n_placed > 0 and bbox_size > 0:
+        #         final_kaggle = (bbox_size ** 2) / n_placed
+        #         ideal_area = self.total_tree_area / 0.6
+        #         ideal_size = np.sqrt(ideal_area) / float(scale_factor)
+        #         ideal_kaggle = (ideal_size ** 2) / self.n_trees
+        #         score_ratio = ideal_kaggle / max(final_kaggle, 0.01)
+        #         if score_ratio > 0.5:
+        #             final_bonus = 0.5 * score_ratio
+        #         elif score_ratio > 0.3:
+        #             final_bonus = 0.2
+        #         else:
+        #             final_bonus = -0.2
+        #         reward += np.clip(final_bonus, -0.3, 0.5)
 
         return reward
 
