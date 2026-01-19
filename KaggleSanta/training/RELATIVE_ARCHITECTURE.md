@@ -1,186 +1,209 @@
-# Relative Transformer Training - Architecture Documentation
+# Relative Transformer Architecture v4.0
 
-**Dosya:** `relative_transformers_training.py`  
-**Son Güncelleme:** 2025-01-19
+## Overview
+Fully polar coordinate-based tree packing with spatial awareness via CoordConv + SPP.
 
----
-
-## 1. Felsefe
-
-**Neden Relative?**
-- Agent mutlak koordinat yerine **pattern** öğrenir
-- "Son ağacın 0.5 solunda yerleştir" gibi davranış öğrenebilir
-- CNN (512×512 grid) zaten mutlak spatial bilgiyi sağlıyor
+**Key innovations:**
+- Polar action space aligned with polar observation features
+- Spatial CNN with Polar CoordConv for position awareness
+- Spatial Pyramid Pooling for multi-scale spatial info
+- Minimal hand-crafted features (scalars/collision disabled)
 
 ---
 
-## 2. Action Space
+## Network Summary
 
-```
-Action: [dx, dy, rotation]
-- dx:       [-5, +5]   Son ağaçtan x offset
-- dy:       [-5, +5]   Son ağaçtan y offset  
-- rotation: [0, 360]   Dönme açısı (derece)
-```
-
-**Anchor:**
-- İlk ağaç → Merkez (5, 5)
-- Sonraki → Son yerleştirilen ağaç
+| Component | Parameters | Description |
+|-----------|------------|-------------|
+| TreeEncoder | ~50K | Fourier-encoded 6D polar features |
+| Transformer | ~800K | 6-layer, 8-head attention |
+| SpatialGridEncoder | ~300K | Polar CoordConv + ResNet + SPP |
+| SimpleFusion | ~100K | Tree + Grid concatenation |
+| Actor/Critic Heads | ~500K | Policy and value networks |
+| **Total** | **~1.78M** | |
 
 ---
 
-## 3. Observation Space
+## Action Space (3D Polar)
 
-### Tree Features: `(100, 4)`
+```
+[r, θ, rotation]
+- r ∈ [0, 5]: distance from board center
+- θ ∈ [-π, π]: angle from board center  
+- rotation ∈ [0, 360]: tree rotation
+```
 
-| # | Feature | Açıklama |
-|---|---------|----------|
-| 0 | dx | Anchor'dan x farkı |
-| 1 | dy | Anchor'dan y farkı |
-| 2 | distance | Anchor'a mesafe |
-| 3 | angle | Anchor'a açı (radyan) |
-
-### Diğer
-
-| İsim | Shape | Açıklama |
-|------|-------|----------|
-| scalars | (5,) | n_placed, bbox, fill, remaining, area |
-| collision_features | (6,) | Risk metrikleri |
-| grid | (512, 512) | Occupancy map (CNN input) |
+Anchor: **Fixed board center (5, 5)** for translation invariance.
 
 ---
 
-## 4. Network Architecture
+## Observation Space
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                      RelativeActorCritic                          │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ TREE BRANCH                                                  │ │
-│  │                                                              │ │
-│  │   Input: (batch, 100, 4)                                     │ │
-│  │      ↓                                                       │ │
-│  │   RelativeTreeEncoder                                        │ │
-│  │   ├── Fourier: 4 × 8 freq × 2 = 64D                         │ │
-│  │   └── Linear(64→128) → ReLU → Linear(128→128)               │ │
-│  │      ↓                                                       │ │
-│  │   Output: (batch, 100, 128)                                  │ │
-│  │      ↓                                                       │ │
-│  │   TransformerEncoder                                         │ │
-│  │   ├── 6 layers                                               │ │
-│  │   ├── 8 heads                                                │ │
-│  │   ├── d_model = 128                                          │ │
-│  │   └── feedforward = 512                                      │ │
-│  │      ↓                                                       │ │
-│  │   Output: (batch, 100, 128)                                  │ │
-│  │      ↓                                                       │ │
-│  │   Mean Pool (masked) → 128D                                  │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ SCALAR BRANCH                                                │ │
-│  │   Input: (batch, 5)                                          │ │
-│  │   Linear(5→32) → ReLU → Linear(32→128) → 128D               │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ COLLISION BRANCH                                             │ │
-│  │   Input: (batch, 6)                                          │ │
-│  │   Linear(6→32) → ReLU → Linear(32→128) → 128D               │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ GRID BRANCH (CNN)                                            │ │
-│  │   Input: (batch, 1, 512, 512)                                │ │
-│  │   Conv2d(1→32, 7×7, s=2) + BN + ReLU   → 256×256            │ │
-│  │   Conv2d(32→64, 3×3, s=2) + BN + ReLU  → 128×128            │ │
-│  │   Conv2d(64→128, 3×3, s=2) + BN + ReLU → 64×64              │ │
-│  │   AdaptiveAvgPool2d(1)                  → 128               │ │
-│  │   Linear(128→128)                       → 128D              │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-├──────────────────────────────────────────────────────────────────┤
-│                     ATTENTION FUSION                              │
-│                                                                   │
-│   Query = proj(scalar + collision + grid) → 128D                 │
-│         ↓                                                         │
-│   CrossAttention(Q=query, K=tree_seq, V=tree_seq)                │
-│         ↓                                                         │
-│   LayerNorm + FFN + LayerNorm → 128D                             │
-│         ↓                                                         │
-│                   STATE: 128D                                     │
-│                                                                   │
-├──────────────────────────────────────────────────────────────────┤
-│                         HEADS                                     │
-│                                                                   │
-│   ┌──────────────┐  ┌──────────────┐  ┌─────────┐  ┌───────────┐│
-│   │ Actor Mean   │  │ Actor LogStd │  │ Critic  │  │ Collision ││
-│   │              │  │              │  │         │  │ Predictor ││
-│   │ 128→128→64→3│  │ 128→32→3    │  │128→128  │  │128→64→1   ││
-│   │     ↓       │  │     ↓        │  │   →64→1 │  │    ↓      ││
-│   │   Tanh      │  │  clamp[-5,0] │  │         │  │  (logit)  ││
-│   │     ↓       │  │     ↓        │  │    ↓    │  │           ││
-│   │   μ (3)     │  │  log_σ (3)   │  │  V (1)  │  │ logit (1) ││
-│   └──────────────┘  └──────────────┘  └─────────┘  └───────────┘│
-│                                                                   │
-└──────────────────────────────────────────────────────────────────┘
-```
+### 1. Tree Features (100 × 6D) — POLAR
+
+Per placed tree, relative to board center:
+
+| Feature | Range | Description |
+|---------|-------|-------------|
+| r | [0, ~7] | Distance to board center |
+| sin_θ | [-1, 1] | Direction sine |
+| cos_θ | [-1, 1] | Direction cosine |
+| r_bbox | [0, ~7] | Distance to bbox center |
+| sin_θ_bbox | [-1, 1] | Direction to bbox sine |
+| cos_θ_bbox | [-1, 1] | Direction to bbox cosine |
+
+**Note:** Clearance and density removed — CNN handles spatial context.
+
+### 2. Scalar Features (11D) — DISABLED
+
+Currently zeroed for testing. CNN provides global context.
+
+### 3. Collision Features (6D) — DISABLED
+
+Currently zeroed. CNN handles collision detection via occupancy grid.
+
+### 4. Occupancy Grid (512 × 512)
+
+Grayscale image of placed trees, processed by SpatialGridEncoder.
 
 ---
 
-## 5. Reward Function
+## SpatialGridEncoder Architecture
 
 ```
-if COLLISION:
-    collision_ratio = min(overlap / tree_area, 1.0)
-    return -5.0 - 15.0 × collision_ratio   # [-20, -5]
+Input: (batch, 1, 512, 512) grayscale occupancy grid
 
-else (SUCCESSFUL PLACEMENT):
-    reward = +1.0                          # Base bonus
-    
-    # Kaggle improvement
-    improvement = old_kaggle - new_kaggle
-    reward += improvement × 10              # (usually small)
-    
-    return reward
+┌─────────────────────────────────────────────────────────┐
+│ Polar CoordConv                                         │
+│ Add coordinate channels: (r, sin_θ, cos_θ) from center  │
+│ → (batch, 4, 512, 512)                                  │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│ Stem Conv (7×7, stride=2)                               │
+│ 4 → 16 channels, 512 → 256                              │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│ ResBlock Stack                                          │
+│ 16 → 32 (256→128) → 64 (128→64) → 64 (64→32) → 64 (32→16) │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│ Spatial Pyramid Pooling (SPP)                           │
+│ Pool at 4×4 + 2×2 + 1×1 = 21 cells                      │
+│ → (batch, 64 × 21 = 1344)                               │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│ Projection                                              │
+│ 1344 → 128 (embed_dim)                                  │
+└─────────────────────────────────────────────────────────┘
+
+Output: (batch, 128)
 ```
 
-**Kaggle Score:** `s² / n` (s = bbox size, n = trees)
-
----
-
-## 6. Training (PPO)
+### Polar CoordConv Details
 
 ```python
-# Hyperparameters
-lr = 3e-4
-gamma = 0.99
-gae_lambda = 0.95
-clip_range = 0.2
-n_epochs = 10
-batch_size = 32
+# Board normalized to [-1, 1]
+r = sqrt(x² + y²) / sqrt(2)   # [0, 1] from center
+sin_θ = y / r                  # Direction
+cos_θ = x / r                  # Direction
+```
 
-# Loss
-loss = policy_loss 
-     + 0.5 × value_loss 
-     + 0.01 × entropy_loss 
-     + 0.1 × collision_loss  # BCE with logits
+**Why Polar CoordConv?**
+- CNN sees each pixel's distance and direction from center
+- Aligns with polar action space
+- Agent can identify "gaps at 45° direction"
+
+### SPP Benefits
+
+| Scale | Cells | Info Captured |
+|-------|-------|---------------|
+| 4×4 | 16 | Regional density per quadrant |
+| 2×2 | 4 | Quadrant-level layout |
+| 1×1 | 1 | Global occupancy |
+
+---
+
+## Network Flow
+
+```
+Observation
+    │
+    ├── relative_trees (100, 6)
+    │       ↓
+    │   RelativeTreeEncoder (Fourier)
+    │       ↓ (100, 128)
+    │   TransformerEncoder (6 layers)
+    │       ↓ (100, 128)
+    │   MaskedMeanPool
+    │       ↓ (128,)
+    │
+    └── grid (512, 512)
+            ↓
+        SpatialGridEncoder
+            ↓ (128,)
+                  │
+                  ↓
+        ┌─────────────────┐
+        │  SimpleFusion   │
+        │  concat + MLP   │
+        │  (256 → 128)    │
+        └─────────────────┘
+                  ↓
+           State (128,)
+                  │
+        ┌─────────┴─────────┐
+        ↓                   ↓
+   ActorHead           CriticHead
+   (128 → 3D)          (128 → 1)
+   mean + logstd       value
 ```
 
 ---
 
-## 7. Termination
+## Reward Function
 
+### Collision Penalty (Progress-Based)
 ```python
-terminated = (trees >= n_trees) OR (collision_count >= 3)
+if collision_area > 0:
+    remaining_trees = n_trees - current_index
+    return -float(remaining_trees)  # Early=-40, Late=-5
+```
+
+### Success Rewards
+```python
+placement_bonus = +3.0  # Per successful placement
+
+# Exploration bonus
+if n_placed >= 2:
+    dist = distance(last_tree, prev_tree)
+    exploration_bonus = min(dist/2, 1) * 0.5  # Up to +0.5
+
+# Kaggle improvement
+kaggle_improvement = (old_score - new_score) * 10
 ```
 
 ---
 
-## 8. Kullanım
+## CLI Usage
 
 ```bash
-python3 training/relative_transformers_training.py --n_trees=50 --n_episodes=1000
+python3 training/relative_transformers_training.py \
+    --n_trees=50 \
+    --n_episodes=1000 \
+    --anchor_mode=board_center \
+    --action_mode=polar \
+    --feature_mode=polar
 ```
+
+---
+
+## Design Philosophy
+
+1. **Polar Everywhere:** Actions, features, and CNN coordinates all polar
+2. **Learn, Don't Engineer:** Disabled hand-crafted scalars/collision features
+3. **Spatial Awareness:** CoordConv + SPP gives CNN position understanding
+4. **Compact:** ~1.78M params total

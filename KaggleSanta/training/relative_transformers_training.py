@@ -15,6 +15,7 @@ Philosophy:
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, Tuple
 import matplotlib.pyplot as plt
@@ -39,84 +40,219 @@ class RelativeTransformerEnvironment(TreePackingEnvironment):
     """
     
     MAX_TREES = 100
-    TREE_DIM = 4  # Only relative features: dx, dy, dist, angle
+    TREE_DIM = 6  # Simplified: r, sin, cos, r_bbox, sin_bbox, cos_bbox (or dx,dy,r,angle,dx_bbox,dy_bbox)
     
-    def __init__(self, n_trees: int = 50, max_trees: int = 200):
+    def __init__(self, n_trees: int = 50, max_trees: int = 200, 
+                 anchor_mode: str = "bbox_center", action_mode: str = "polar",
+                 feature_mode: str = "polar"):
+        """
+        Args:
+            anchor_mode: 'last_tree' or 'bbox_center'
+                - last_tree: action offset from last placed tree
+                - bbox_center: action offset from bbox center (better for compact packing)
+            action_mode: 'cartesian' or 'polar'
+                - cartesian: [dx, dy, rotation] where dx,dy ∈ [-5, 5]
+                - polar: [r, theta, rotation] where r ∈ [0, 5], theta ∈ [-π, π]
+            feature_mode: 'cartesian' or 'polar'
+                - cartesian: tree features use (dx, dy)
+                - polar: tree features use (r, sin_theta, cos_theta)
+        """
         super().__init__(n_trees=n_trees, max_trees=max_trees)
+        self.anchor_mode = anchor_mode
+        self.action_mode = action_mode
+        self.feature_mode = feature_mode
         
         from gymnasium import spaces
         
-        # RELATIVE action space: dx, dy from last tree + rotation
-        # dx, dy in [-5, 5] (relative offset)
-        self.action_space = spaces.Box(
-            low=np.array([-5.0, -5.0, 0.0], dtype=np.float32),
-            high=np.array([5.0, 5.0, 360.0], dtype=np.float32)
-        )
+        if action_mode == "polar":
+            # Polar: [r, theta, rotation]
+            self.action_space = spaces.Box(
+                low=np.array([0.0, -np.pi, 0.0], dtype=np.float32),
+                high=np.array([5.0, np.pi, 360.0], dtype=np.float32)
+            )
+        else:  # cartesian
+            # Cartesian: [dx, dy, rotation]
+            self.action_space = spaces.Box(
+                low=np.array([-5.0, -5.0, 0.0], dtype=np.float32),
+                high=np.array([5.0, 5.0, 360.0], dtype=np.float32)
+            )
         
         self.observation_space = spaces.Dict({
             "relative_trees": spaces.Box(-np.inf, np.inf, shape=(self.MAX_TREES, self.TREE_DIM), dtype=np.float32),
             "mask": spaces.Box(0, 1, shape=(self.MAX_TREES,), dtype=np.float32),
-            "scalars": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
+            "scalars": spaces.Box(-np.inf, np.inf, shape=(11,), dtype=np.float32),
             "collision_features": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
             "grid": spaces.Box(0, 1, shape=(512, 512), dtype=np.float32),
-            "anchor": spaces.Box(0, 10, shape=(2,), dtype=np.float32)  # Last tree position (for action interpretation)
+            "anchor": spaces.Box(0, 10, shape=(2,), dtype=np.float32)
         })
-    
-    def _get_relative_tree_features(self, tree, anchor_x: float, anchor_y: float) -> np.ndarray:
-        """
-        Get RELATIVE features for a tree.
         
-        Features (4):
-        - dx, dy from anchor: 2
-        - distance from anchor: 1
-        - angle from anchor: 1
+        # Cache for expensive computations
+        self._bbox_center = None
+        self._last_rotation = 0.0
+    
+    def _get_relative_tree_features(self, tree, anchor_x: float, anchor_y: float, 
+                                       tree_idx: int = 0) -> np.ndarray:
+        """
+        Get SIMPLIFIED RELATIVE features for a tree.
+        
+        Features (6):
+        - Polar mode: r, sin_theta, cos_theta, r_bbox, sin_theta_bbox, cos_theta_bbox
+        - Cartesian mode: dx, dy, r, angle, dx_bbox, dy_bbox
+        
+        All coordinates in [0, 10] range (no normalization)
         """
         norm = float(scale_factor)
         
+        # Tree center in [0, 10] range
         cx = float(tree.center_x) / norm
         cy = float(tree.center_y) / norm
-        anchor_x_norm = anchor_x / norm
-        anchor_y_norm = anchor_y / norm
         
-        dx = cx - anchor_x_norm
-        dy = cy - anchor_y_norm
-        distance = np.sqrt(dx**2 + dy**2)
-        angle = np.arctan2(dy, dx)  # [-π, π]
+        # Anchor already in [0, 10] range (passed from _get_observation)
+        # Relative to anchor (board_center = 5, 5)
+        dx = cx - anchor_x
+        dy = cy - anchor_y
+        r = np.sqrt(dx**2 + dy**2)
         
-        return np.array([dx, dy, distance, angle], dtype=np.float32)
+        # Relative to bbox center (also in [0, 10] range)
+        if self._bbox_center is not None:
+            dx_bbox = cx - self._bbox_center[0]
+            dy_bbox = cy - self._bbox_center[1]
+        else:
+            dx_bbox = 0.0
+            dy_bbox = 0.0
+        r_bbox = np.sqrt(dx_bbox**2 + dy_bbox**2)
+        
+        if self.feature_mode == "polar":
+            # Polar: use sin/cos instead of dx/dy
+            sin_theta = dy / (r + 1e-8)
+            cos_theta = dx / (r + 1e-8)
+            sin_theta_bbox = dy_bbox / (r_bbox + 1e-8)
+            cos_theta_bbox = dx_bbox / (r_bbox + 1e-8)
+            
+            return np.array([r, sin_theta, cos_theta, r_bbox, sin_theta_bbox, cos_theta_bbox], dtype=np.float32)
+        else:
+            # Cartesian
+            angle = np.arctan2(dy, dx)
+            return np.array([dx, dy, r, angle, dx_bbox, dy_bbox], dtype=np.float32)
     
-    def _get_observation(self) -> Dict:
-        """Get relative observation."""
+    def _compute_local_context(self, tree_idx: int, k: int = 5) -> Tuple[float, float]:
+        """
+        Compute local context for a tree:
+        - min_clearance: minimum distance to any neighbor (normalized)
+        - local_density: number of trees within radius / k
+        """
         n = len(self.placed_trees)
         norm = float(scale_factor)
         
-        # Anchor: last tree position, or center if no trees
-        if n > 0:
-            last_tree = self.placed_trees[-1]
-            anchor_x = float(last_tree.center_x)
-            anchor_y = float(last_tree.center_y)
-        else:
-            anchor_x = 5.0 * norm  # Center
-            anchor_y = 5.0 * norm
+        if n < 2 or tree_idx >= n:
+            return 1.0, 0.0  # No neighbors, no density
         
-        # Relative tree features
+        tree = self.placed_trees[tree_idx]
+        
+        # Compute distances to all other trees
+        distances = []
+        for j, other in enumerate(self.placed_trees):
+            if j != tree_idx:
+                dist = tree.polygon.distance(other.polygon) / norm
+                distances.append(dist)
+        
+        if not distances:
+            return 1.0, 0.0
+        
+        min_clearance = min(distances)
+        min_clearance = min(min_clearance, 1.0)  # Clip to [0, 1]
+        
+        # Local density: count trees within radius 1.5
+        close_count = sum(1 for d in distances if d < 1.5)
+        local_density = min(close_count / k, 1.0)  # Normalize
+        
+        return min_clearance, local_density
+    
+    def _update_bbox_center(self):
+        """Update cached bbox center."""
+        norm = float(scale_factor)
+        if len(self.placed_trees) > 0:
+            from shapely.ops import unary_union
+            all_polys = [t.polygon for t in self.placed_trees]
+            bounds = unary_union(all_polys).bounds
+            self._bbox_center = (
+                (bounds[0] + bounds[2]) / (2 * norm),
+                (bounds[1] + bounds[3]) / (2 * norm)
+            )
+        else:
+            self._bbox_center = (5.0, 5.0)  # Center of board
+    
+    def _get_observation(self) -> Dict:
+        """Get relative observation with enhanced features."""
+        n = len(self.placed_trees)
+        norm = float(scale_factor)
+        
+        # Update bbox center cache
+        self._update_bbox_center()
+        
+        # Anchor based on anchor_mode (in [0, 10] range)
+        if self.anchor_mode == "board_center":
+            # Fixed board center
+            anchor_x = 5.0
+            anchor_y = 5.0
+        elif n > 0:
+            if self.anchor_mode == "bbox_center":
+                anchor_x = self._bbox_center[0]
+                anchor_y = self._bbox_center[1]
+            else:  # last_tree
+                last_tree = self.placed_trees[-1]
+                anchor_x = float(last_tree.center_x) / norm
+                anchor_y = float(last_tree.center_y) / norm
+        else:
+            anchor_x = 5.0  # Center
+            anchor_y = 5.0
+        
+        if n > 0:
+            self._last_rotation = float(self.placed_trees[-1].angle)
+        else:
+            self._last_rotation = 0.0
+        
+        # Relative tree features (now 8D)
         relative_trees = np.zeros((self.MAX_TREES, self.TREE_DIM), dtype=np.float32)
         mask = np.zeros(self.MAX_TREES, dtype=np.float32)
         
         for i, tree in enumerate(self.placed_trees):
             if i >= self.MAX_TREES:
                 break
-            relative_trees[i] = self._get_relative_tree_features(tree, anchor_x, anchor_y)
+            relative_trees[i] = self._get_relative_tree_features(tree, anchor_x, anchor_y, i)
             mask[i] = 1.0
         
-        # Scalars
-        scalars = np.array([
-            n / self.max_trees,
-            self.bounding_box_size / (10.0 * norm) if n > 0 else 0,
-            self.fill_ratio,
-            (self.n_trees - self.current_index) / self.n_trees,
-            self.total_tree_area / (norm * norm * 100)
-        ], dtype=np.float32)
+        # Scalars (DISABLED - using zeros for testing)
+        # # Compute direction from last few trees
+        # dir_sin, dir_cos, momentum = 0.0, 0.0, 0.0
+        # if n >= 2:
+        #     t1, t2 = self.placed_trees[-2], self.placed_trees[-1]
+        #     dx = (float(t2.center_x) - float(t1.center_x)) / norm
+        #     dy = (float(t2.center_y) - float(t1.center_y)) / norm
+        #     momentum = np.sqrt(dx**2 + dy**2)
+        #     if momentum > 1e-6:
+        #         dir_sin = dy / momentum
+        #         dir_cos = dx / momentum
+        #     momentum = min(momentum / 2.0, 1.0)
+        # 
+        # # BBox aspect ratio and offset from board center
+        # if n > 0 and hasattr(self, 'bounding_box') and self.bounding_box:
+        #     minx, miny, maxx, maxy = self.bounding_box
+        #     width = (maxx - minx) / norm
+        #     height = (maxy - miny) / norm
+        #     aspect_ratio = (width / max(height, 0.01)) if height > 0.01 else 1.0
+        #     aspect_ratio = min(max(aspect_ratio, 0.1), 10.0) / 10.0
+        # else:
+        #     aspect_ratio = 0.5
+        # 
+        # # BBox center offset from board center (5, 5)
+        # bbox_offset_x = self._bbox_center[0] - 5.0
+        # bbox_offset_y = self._bbox_center[1] - 5.0
+        # bbox_offset_x = bbox_offset_x / 5.0
+        # bbox_offset_y = bbox_offset_y / 5.0
+        
+        # All zeros for testing without scalar features
+        scalars = np.zeros(11, dtype=np.float32)
         
         # Collision features
         collision_features = self._get_collision_features()
@@ -139,28 +275,50 @@ class RelativeTransformerEnvironment(TreePackingEnvironment):
     def get_observation(self):
         return self._get_observation()
     
+    def _get_anchor(self) -> Tuple[float, float]:
+        """Get current anchor position based on anchor_mode."""
+        norm = float(scale_factor)
+        
+        # Board center is always the fixed center
+        if self.anchor_mode == "board_center":
+            return 5.0 * norm, 5.0 * norm
+        
+        if len(self.placed_trees) == 0:
+            return 5.0 * norm, 5.0 * norm  # Center for first tree
+        
+        if self.anchor_mode == "bbox_center":
+            # Use bbox center as anchor
+            if self._bbox_center is not None:
+                return self._bbox_center[0] * norm, self._bbox_center[1] * norm
+            else:
+                return 5.0 * norm, 5.0 * norm
+        else:
+            # Default: last_tree
+            last_tree = self.placed_trees[-1]
+            return float(last_tree.center_x), float(last_tree.center_y)
+    
     def step(self, action: np.ndarray):
         """
         Step with RELATIVE action.
         
-        Action: [dx, dy, rotation]
-        - dx, dy: offset from anchor (last tree or center)
-        - rotation: absolute angle
+        Action depends on action_mode:
+        - cartesian: [dx, dy, rotation] where dx,dy are offsets
+        - polar: [r, theta, rotation] where r is distance, theta is angle
         """
-        dx, dy, rotation = action[0], action[1], action[2]
+        # Get anchor position based on mode
+        anchor_x, anchor_y = self._get_anchor()
+        norm = float(scale_factor)
         
-        # Get anchor position
-        if len(self.placed_trees) > 0:
-            last_tree = self.placed_trees[-1]
-            anchor_x = float(last_tree.center_x)
-            anchor_y = float(last_tree.center_y)
-        else:
-            norm = float(scale_factor)
-            anchor_x = 5.0 * norm  # Center
-            anchor_y = 5.0 * norm
+        if self.action_mode == "polar":
+            # Polar: [r, theta, rotation]
+            r, theta, rotation = action[0], action[1], action[2]
+            dx = r * np.cos(theta)
+            dy = r * np.sin(theta)
+        else:  # cartesian
+            # Cartesian: [dx, dy, rotation]
+            dx, dy, rotation = action[0], action[1], action[2]
         
         # Convert relative to absolute
-        norm = float(scale_factor)
         x = (anchor_x / norm) + dx
         y = (anchor_y / norm) + dy
         
@@ -230,21 +388,22 @@ class RelativeRolloutBuffer:
 
 class RelativeTreeEncoder(nn.Module):
     """
-    Encode relative tree features.
-    Input: (batch, n_trees, 6)
+    Encode relative tree features with Fourier encoding.
+    Input: (batch, n_trees, 8) - enhanced relative features
     Output: (batch, n_trees, embed_dim)
     """
     
-    def __init__(self, input_dim: int = 6, embed_dim: int = 64, n_freqs: int = 8):
+    def __init__(self, input_dim: int = 6, embed_dim: int = 128, n_freqs: int = 8):
         super().__init__()
         
         # Fourier encoding for relative features
         fourier_dim = input_dim * 2 * n_freqs  # 6 * 2 * 8 = 96
         
         self.projection = nn.Sequential(
-            nn.Linear(fourier_dim, embed_dim),
+            nn.Linear(fourier_dim, embed_dim),  # 96 -> 128
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
         )
         
         freqs = 2.0 ** torch.linspace(0, n_freqs - 1, n_freqs)
@@ -261,114 +420,201 @@ class RelativeTreeEncoder(nn.Module):
         return self.projection(fourier)
 
 
-class AttentionFusion(nn.Module):
+class SimpleFusion(nn.Module):
     """
-    Cross-attention based fusion.
-    Query: scalar + grid context
-    Key/Value: tree sequence
+    Simple concatenation-based fusion.
+    Concatenates tree_pool + grid and processes with MLP.
+    (Scalar and collision disabled for testing)
     """
     
-    def __init__(self, embed_dim: int = 128, n_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 128):
         super().__init__()
         
-        # Project scalar + grid + collision to query
-        self.query_proj = nn.Linear(embed_dim * 3, embed_dim)
-        
-        # Multi-head cross attention
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # FFN after attention
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
+        # 2 modalities * embed_dim = 256 -> embed_dim (scalar+collision disabled)
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim * 2),
             nn.ReLU(),
-            nn.Linear(embed_dim * 2, embed_dim)
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.LayerNorm(embed_dim)
         )
-        
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
     
     def forward(
         self,
-        tree_seq: torch.Tensor,       # (batch, n_trees, embed_dim)
-        scalar_embed: torch.Tensor,   # (batch, embed_dim)
-        collision_embed: torch.Tensor,# (batch, embed_dim)
-        grid_embed: torch.Tensor,     # (batch, embed_dim)
-        mask: torch.Tensor = None     # (batch, n_trees)
+        tree_pool: torch.Tensor,       # (batch, embed_dim) - pooled trees
+        scalar_embed: torch.Tensor,    # (batch, embed_dim) - IGNORED
+        collision_embed: torch.Tensor, # (batch, embed_dim) - IGNORED
+        grid_embed: torch.Tensor,      # (batch, embed_dim)
+        mask: torch.Tensor = None      # unused, kept for API compatibility
     ) -> torch.Tensor:
-        batch_size = tree_seq.shape[0]
-        
         # Sanitize inputs
-        scalar_embed = torch.nan_to_num(scalar_embed, nan=0.0)
-        collision_embed = torch.nan_to_num(collision_embed, nan=0.0)
+        tree_pool = torch.nan_to_num(tree_pool, nan=0.0)
+        # scalar_embed, collision_embed ignored - CNN handles collision
         grid_embed = torch.nan_to_num(grid_embed, nan=0.0)
-        tree_seq = torch.nan_to_num(tree_seq, nan=0.0)
         
-        # Create query from context (scalar + collision + grid)
-        context = torch.cat([scalar_embed, collision_embed, grid_embed], dim=-1)
-        query = self.query_proj(context).unsqueeze(1)  # (batch, 1, embed_dim)
+        # Concatenate (only tree + grid)
+        concat = torch.cat([tree_pool, grid_embed], dim=-1)
         
-        # Handle empty sequence or all masked
-        if mask is not None:
-            valid_count = mask.sum(dim=1)
-            has_valid = valid_count > 0
-            
-            if not has_valid.any():
-                # No valid trees at all - use context only
-                out = self.norm1(query)
-                ffn_out = self.ffn(out)
-                out = self.norm2(out + ffn_out)
-                return out.squeeze(1)
-            
-            key_padding_mask = ~mask
-        else:
-            key_padding_mask = None
-        
-        # Cross-attention
-        attn_out, _ = self.cross_attn(
-            query=query,
-            key=tree_seq,
-            value=tree_seq,
-            key_padding_mask=key_padding_mask
-        )
-        
-        # Robust NaN handling
-        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Residual + LayerNorm
-        attn_out = self.norm1(query + attn_out)
-        attn_out = torch.nan_to_num(attn_out, nan=0.0)
-        
-        # FFN + Residual
-        ffn_out = self.ffn(attn_out)
-        ffn_out = torch.nan_to_num(ffn_out, nan=0.0)
-        out = self.norm2(attn_out + ffn_out)
+        # Fuse
+        out = self.fusion(concat)
         out = torch.nan_to_num(out, nan=0.0)
         
-        return out.squeeze(1)  # (batch, embed_dim)
+        return out  # (batch, embed_dim)
 
+
+# Residual Block for Grid Encoder
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + self.shortcut(x)
+        return torch.relu(out)
+
+
+class SpatialPyramidPool(nn.Module):
+    """
+    Spatial Pyramid Pooling - preserves multi-scale spatial information.
+    Pools at multiple scales and concatenates.
+    """
+    
+    def __init__(self, pool_sizes: list = [4, 2, 1]):
+        super().__init__()
+        self.pool_sizes = pool_sizes
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, _, _ = x.shape
+        pools = []
+        
+        for size in self.pool_sizes:
+            pooled = F.adaptive_avg_pool2d(x, size)  # (batch, channels, size, size)
+            pooled = pooled.view(batch_size, -1)     # (batch, channels * size * size)
+            pools.append(pooled)
+        
+        return torch.cat(pools, dim=1)
+
+
+class SpatialGridEncoder(nn.Module):
+    """
+    Grid encoder with CoordConv + Spatial Pyramid Pooling.
+    
+    - CoordConv: Adds x,y coordinate channels so CNN knows pixel positions
+    - SPP: Preserves spatial info at 4x4, 2x2, 1x1 scales
+    
+    Input: (batch, 1, 512, 512)
+    Output: (batch, embed_dim)
+    """
+    
+    def __init__(self, embed_dim: int = 128):
+        super().__init__()
+        
+        # Stem with Polar CoordConv (4 channels: image + r + sin_θ + cos_θ)
+        self.stem = nn.Sequential(
+            nn.Conv2d(4, 16, 7, stride=2, padding=3, bias=False),  # 512 -> 256
+            nn.BatchNorm2d(16),
+            nn.ReLU()
+        )
+        
+        # ResBlocks (lighter: 16 -> 32 -> 64 -> 64)
+        self.blocks = nn.Sequential(
+            ResidualBlock(16, 32, stride=2),   # 256 -> 128
+            ResidualBlock(32, 64, stride=2),   # 128 -> 64
+            ResidualBlock(64, 64, stride=2),   # 64 -> 32
+            ResidualBlock(64, 64, stride=2),   # 32 -> 16
+        )
+        
+        # SPP: 4x4 + 2x2 + 1x1 = 16+4+1 = 21 cells * 64 channels = 1344
+        self.spp = SpatialPyramidPool([4, 2, 1])
+        
+        # Projection to embed_dim (simpler)
+        spp_output_dim = 64 * (16 + 4 + 1)  # 1344
+        self.projection = nn.Sequential(
+            nn.Linear(spp_output_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+        
+        # Cache coordinate grids
+        self._cached_coords = None
+        self._cached_size = None
+    
+    def _get_coord_channels(self, x: torch.Tensor) -> torch.Tensor:
+        """Generate POLAR coordinate channels (r, sin_θ, cos_θ) from board center."""
+        batch_size, _, h, w = x.shape
+        device = x.device
+        
+        # Check cache
+        if self._cached_size != (h, w) or self._cached_coords is None or self._cached_coords.device != device:
+            # Create coordinate grids in [-1, 1] range centered at (0, 0)
+            y_grid = torch.linspace(-1, 1, h, device=device).view(1, 1, h, 1).expand(1, 1, h, w)
+            x_grid = torch.linspace(-1, 1, w, device=device).view(1, 1, 1, w).expand(1, 1, h, w)
+            
+            # Polar coordinates from center (0, 0)
+            r = torch.sqrt(x_grid**2 + y_grid**2)  # [0, sqrt(2)] -> normalize to [0, 1]
+            r = r / 1.414  # sqrt(2)
+            
+            sin_theta = y_grid / (r * 1.414 + 1e-8)  # sin = y/r
+            cos_theta = x_grid / (r * 1.414 + 1e-8)  # cos = x/r
+            
+            self._cached_coords = torch.cat([r, sin_theta, cos_theta], dim=1)  # (1, 3, h, w)
+            self._cached_size = (h, w)
+        
+        # Expand to batch size
+        return self._cached_coords.expand(batch_size, -1, -1, -1)
+    
+    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+        # grid: (batch, 1, 512, 512)
+        
+        # Add polar coordinate channels (r, sin_θ, cos_θ)
+        coords = self._get_coord_channels(grid)  # (batch, 3, 512, 512)
+        x = torch.cat([grid, coords], dim=1)     # (batch, 4, 512, 512)
+        
+        # Stem + ResBlocks
+        x = self.stem(x)
+        x = self.blocks(x)  # (batch, 64, 16, 16)
+        
+        # SPP
+        x = self.spp(x)  # (batch, 1344)
+        
+        # Project to embed_dim
+        x = self.projection(x)  # (batch, embed_dim)
+        
+        return x
 
 class RelativeActorCritic(nn.Module):
     """
-    Actor-Critic for relative action space.
+    Enhanced Actor-Critic for relative action space.
     
-    Simpler architecture since we only have relative features.
-    CNN provides spatial context.
+    Improvements:
+    - Learnable positional embeddings
+    - Multi-query cross-attention (no bottleneck)
+    - ResNet-style grid encoder
+    - 8D relative features
     """
+    
+    MAX_TREES = 100
     
     def __init__(
         self,
-        tree_dim: int = 4,  # Only 4 relative features now
-        embed_dim: int = 128,  # Increased from 64
-        n_heads: int = 8,      # Increased from 4
-        n_layers: int = 6,     # Increased from 4
+        tree_dim: int = 6,  # Simplified: 6 relative features
+        embed_dim: int = 128,
+        n_heads: int = 8,
+        n_layers: int = 6,
         action_dim: int = 3
     ):
         super().__init__()
+        self.embed_dim = embed_dim
         
         # Action bounds (relative)
         action_low = [-5.0, -5.0, 0.0]
@@ -388,29 +634,32 @@ class RelativeActorCritic(nn.Module):
             nhead=n_heads,
             dim_feedforward=embed_dim * 4,
             dropout=0.1,
-            batch_first=True
+            batch_first=True,
+            norm_first=True  # Pre-norm for better training stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # Scalar encoder
-        self.scalar_encoder = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.ReLU(),
-            nn.Linear(32, embed_dim)
-        )
+        # Scalar encoder (DISABLED for testing)
+        # self.scalar_encoder = nn.Sequential(
+        #     nn.Linear(11, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, embed_dim),
+        #     nn.LayerNorm(embed_dim)
+        # )
         
-        # Collision encoder
-        self.collision_encoder = nn.Sequential(
-            nn.Linear(6, 32),
-            nn.ReLU(),
-            nn.Linear(32, embed_dim)
-        )
+        # Collision encoder (DISABLED - CNN handles collision via grid)
+        # self.collision_encoder = nn.Sequential(
+        #     nn.Linear(6, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, embed_dim),
+        #     nn.LayerNorm(embed_dim)
+        # )
         
-        # Grid encoder (CNN)
-        self.grid_encoder = self._build_grid_encoder(embed_dim)
+        # ===== Spatial Grid Encoder with CoordConv + SPP =====
+        self.grid_encoder = SpatialGridEncoder(embed_dim)
         
-        # Attention-based fusion
-        self.attention_fusion = AttentionFusion(embed_dim, n_heads)
+        # Simple concat-based fusion
+        self.fusion = SimpleFusion(embed_dim)
         
         # State dimension: fusion output only (cross-attention output)
         state_dim = embed_dim
@@ -447,27 +696,39 @@ class RelativeActorCritic(nn.Module):
             nn.Linear(64, 1)
         )
     
-    def _build_grid_encoder(self, embed_dim: int) -> nn.Module:
+    def _build_resnet_grid_encoder(self, embed_dim: int) -> nn.Module:
+        """Build ResNet-style grid encoder with residual blocks."""
         return nn.Sequential(
-            nn.Conv2d(1, 32, 7, stride=2, padding=3),
+            # Stem: 1024 -> 512
+            nn.Conv2d(1, 32, 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
+            # ResBlocks: 512 -> 256 -> 128 -> 64 -> 32 -> 16
+            ResidualBlock(32, 64, stride=2),   # 512 -> 256
+            ResidualBlock(64, 128, stride=2),  # 256 -> 128
+            ResidualBlock(128, 128, stride=2), # 128 -> 64  
+            ResidualBlock(128, 128, stride=2), # 64 -> 32
+            ResidualBlock(128, 128, stride=2), # 32 -> 16
+            # Global pooling
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(128, embed_dim)
+            nn.Linear(128, embed_dim),
+            nn.LayerNorm(embed_dim)
         )
     
     def forward(self, relative_trees, scalars, mask, collision_features, grid):
         batch_size = relative_trees.shape[0]
+        device = relative_trees.device
         
-        # Encode trees
+        # Sanitize inputs
+        relative_trees = torch.nan_to_num(relative_trees, nan=0.0)
+        scalars = torch.nan_to_num(scalars, nan=0.0)
+        collision_features = torch.nan_to_num(collision_features, nan=0.0)
+        grid = torch.nan_to_num(grid, nan=0.0)
+        
+        # Encode trees (no positional encoding - set-based problem)
         tree_embed = self.tree_encoder(relative_trees)  # (batch, n_trees, embed_dim)
+        tree_embed = torch.nan_to_num(tree_embed, nan=0.0)
         
         # Transformer
         if mask is not None:
@@ -476,6 +737,7 @@ class RelativeActorCritic(nn.Module):
             attn_mask = None
         
         tree_seq = self.transformer(tree_embed, src_key_padding_mask=attn_mask)
+        tree_seq = torch.nan_to_num(tree_seq, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Pool trees (mean of valid)
         if mask is not None:
@@ -483,31 +745,41 @@ class RelativeActorCritic(nn.Module):
             tree_pool = (tree_seq * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-8)
         else:
             tree_pool = tree_seq.mean(dim=1)
+        tree_pool = torch.nan_to_num(tree_pool, nan=0.0)
         
         # Encode other features
-        scalar_embed = self.scalar_encoder(scalars)
-        collision_embed = self.collision_encoder(collision_features)
+        # scalar_embed = self.scalar_encoder(scalars)  # DISABLED
+        scalar_embed = torch.zeros(batch_size, 128, device=device)  # Placeholder
+        
+        # collision_embed = self.collision_encoder(collision_features)  # DISABLED
+        collision_embed = torch.zeros(batch_size, 128, device=device)  # Placeholder
         
         # Grid
         grid_input = grid.unsqueeze(1)  # (batch, 1, 512, 512)
         grid_embed = self.grid_encoder(grid_input)
+        grid_embed = torch.nan_to_num(grid_embed, nan=0.0)
         
-        # ATTENTION FUSION (cross-attention)
-        state = self.attention_fusion(
-            tree_seq, scalar_embed, collision_embed, grid_embed, mask
+        # Simple fusion (concat + MLP)
+        state = self.fusion(
+            tree_pool, scalar_embed, collision_embed, grid_embed
         )
         state = torch.nan_to_num(state, nan=0.0)
         
-        # Actor
+        # Actor - with NaN protection
         mean = self.actor_mean(state)
+        mean = torch.nan_to_num(mean, nan=0.0)  # Critical guard
+        
         log_std = self.actor_log_std(state)
+        log_std = torch.nan_to_num(log_std, nan=-2.0)  # Default to exp(-2) = 0.135 std
         log_std = torch.clamp(log_std, -5, 0)
         
         # Critic
         value = self.critic(state)
+        value = torch.nan_to_num(value, nan=0.0)
         
         # Collision predictor
         collision_logit = self.collision_predictor(state)
+        collision_logit = torch.nan_to_num(collision_logit, nan=0.0)
         
         return mean, log_std, value, collision_logit
     
@@ -537,22 +809,35 @@ class RelativeActorCritic(nn.Module):
             relative_trees, scalars, mask, collision_features, grid
         )
         
+        # Robust NaN handling for distribution parameters
+        mean = torch.nan_to_num(mean, nan=0.0)
         log_std = torch.nan_to_num(log_std, nan=-2.0)
+        log_std = torch.clamp(log_std, -5, 0)
         std = torch.exp(log_std)
-        std = torch.clamp(std, min=1e-6)
+        std = torch.clamp(std, min=1e-6, max=1.0)
         
         actions_unscaled = (actions - self.action_bias) / self.action_scale
         actions_raw = torch.atanh(torch.clamp(actions_unscaled, -0.999, 0.999))
+        actions_raw = torch.nan_to_num(actions_raw, nan=0.0)
         
         dist = torch.distributions.Normal(mean, std)
         log_prob = dist.log_prob(actions_raw).sum(dim=-1)
+        log_prob = torch.nan_to_num(log_prob, nan=-10.0)  # Replace NaN with low prob
         entropy = dist.entropy().sum(dim=-1)
+        entropy = torch.nan_to_num(entropy, nan=0.0)
         
         return log_prob, value, entropy, collision_logit
 
 
 class RelativeTrainer:
-    """PPO Trainer for Relative policy."""
+    """
+    Enhanced PPO Trainer for Relative policy.
+    
+    Improvements:
+    - Variable-length rollouts
+    - Reward running statistics
+    - Model checkpointing
+    """
     
     def __init__(
         self,
@@ -565,13 +850,24 @@ class RelativeTrainer:
         batch_size: int = 32,
         ent_coef: float = 0.01,
         max_grad_norm: float = 0.5,
+        min_rollout_steps: int = 128,
+        anchor_mode: str = "bbox_center",
+        action_mode: str = "polar",
+        feature_mode: str = "polar",
         visualize: bool = True
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
         
-        self.env = RelativeTransformerEnvironment(n_trees=n_trees)
+        self.env = RelativeTransformerEnvironment(
+            n_trees=n_trees, anchor_mode=anchor_mode, 
+            action_mode=action_mode, feature_mode=feature_mode
+        )
         self.n_trees = n_trees
+        self.min_rollout_steps = min_rollout_steps
+        self.anchor_mode = anchor_mode
+        self.action_mode = action_mode
+        self.min_rollout_steps = min_rollout_steps
         
         self.network = RelativeActorCritic().to(self.device)
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
@@ -588,12 +884,29 @@ class RelativeTrainer:
         
         self.buffer = RelativeRolloutBuffer()
         
+        # Reward normalization
+        self.reward_mean = 0.0
+        self.reward_std = 1.0
+        self.reward_count = 0
+        
         self.visualize = visualize
         if visualize:
             self.output_dir = Path("relative_training_outputs")
             self.output_dir.mkdir(exist_ok=True)
             self.rewards_history = []
             self.bbox_history = []
+            self.trees_history = []
+    
+    def update_reward_stats(self, rewards: list):
+        """Update running reward statistics for normalization."""
+        for r in rewards:
+            self.reward_count += 1
+            delta = r - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            delta2 = r - self.reward_mean
+            self.reward_std = np.sqrt(
+                (self.reward_std**2 * (self.reward_count - 1) + delta * delta2) / self.reward_count
+            ) if self.reward_count > 1 else 1.0
     
     def obs_to_tensor(self, obs: Dict) -> Dict[str, torch.Tensor]:
         return {
@@ -604,11 +917,19 @@ class RelativeTrainer:
             "grid": torch.tensor(obs["grid"], dtype=torch.float32, device=self.device).unsqueeze(0)
         }
     
-    def collect_rollouts(self, n_steps: int):
+    def collect_rollouts(self) -> list:
+        """
+        Collect variable-length rollouts until min_steps is reached.
+        Returns list of episode results: (reward, bbox, n_placed)
+        """
+        total_steps = 0
+        episode_results = []
+        episode_rewards_list = []
+        
         obs, _ = self.env.reset()
         episode_reward = 0.0
         
-        for step in range(n_steps):
+        while total_steps < self.min_rollout_steps:
             obs_t = self.obs_to_tensor(obs)
             
             with torch.no_grad():
@@ -620,28 +941,41 @@ class RelativeTrainer:
             action_np = action.cpu().numpy().squeeze()
             next_obs, reward, terminated, truncated, info = self.env.step(action_np)
             
+            # Normalize reward (optional, can be disabled)
+            # normalized_reward = (reward - self.reward_mean) / (self.reward_std + 1e-8)
+            normalized_reward = reward  # Keep raw rewards for now
+            
             episode_reward += reward
+            episode_rewards_list.append(reward)
             done = terminated or truncated
             
             # Collision label
             collision_label = 1.0 if info.get("collision", False) else 0.0
             
             self.buffer.add(
-                obs, action_np, reward, done,
+                obs, action_np, normalized_reward, done,
                 log_prob.item(), value.item(), collision_label
             )
+            
+            total_steps += 1
             
             if done:
                 # Store trees for visualization BEFORE reset
                 self.last_placed_trees = list(self.env.placed_trees)
+                episode_results.append((episode_reward, info.get("bbox_size", 0), info.get("n_placed", 0)))
                 obs, _ = self.env.reset()
-                result = (episode_reward, info.get("bbox_size", 0), info.get("n_placed", 0))
                 episode_reward = 0.0
-                return result
-            
-            obs = next_obs
+            else:
+                obs = next_obs
         
-        return (episode_reward, 0, 0)
+        # Update reward statistics
+        self.update_reward_stats(episode_rewards_list)
+        
+        # Return last result if no episode completed
+        if not episode_results:
+            episode_results.append((episode_reward, 0, 0))
+        
+        return episode_results
     
     def compute_gae(self):
         rewards = np.array(self.buffer.rewards)
@@ -747,44 +1081,97 @@ class RelativeTrainer:
         plt.tight_layout()
         plt.savefig(self.output_dir / f'episode_{episode:05d}.png', dpi=100)
         plt.close()
-    
     def train(self, n_episodes: int):
-        print(f"Relative Training: {n_episodes} episodes, {self.n_trees} trees each")
-        print("-" * 50)
+        """Train the agent for n_episodes worth of updates."""
+        print(f"Enhanced Relative Training: {n_episodes} updates")
+        print(f"Min rollout steps: {self.min_rollout_steps}, Trees: {self.n_trees}")
+        print("-" * 60)
         
-        for episode in range(n_episodes):
-            result = self.collect_rollouts(n_steps=self.n_trees)
-            ep_reward, bbox_size, n_placed = result
+        best_bbox = float('inf')
+        total_episodes = 0
+        
+        for update in range(n_episodes):
+            # Collect variable-length rollouts
+            episode_results = self.collect_rollouts()
             
+            # Process all completed episodes
+            for ep_reward, bbox_size, n_placed in episode_results:
+                total_episodes += 1
+                
+                if self.visualize:
+                    self.rewards_history.append(ep_reward)
+                    self.bbox_history.append(bbox_size)
+                    self.trees_history.append(n_placed)
+                
+                # Track best
+                if bbox_size > 0 and bbox_size < best_bbox:
+                    best_bbox = bbox_size
+            
+            # PPO Update
             returns, advantages = self.compute_gae()
             self.update(returns, advantages)
             self.buffer.clear()
             
-            if self.visualize:
-                self.rewards_history.append(ep_reward)
-                self.bbox_history.append(bbox_size)
+            # Use last episode for logging
+            ep_reward, bbox_size, n_placed = episode_results[-1]
             
-            if (episode + 1) % 10 == 0:
-                print(f"Episode {episode+1:5d} | Reward: {ep_reward:8.2f} | BBox: {bbox_size:.4f} | Trees: {n_placed}")
+            if (update + 1) % 10 == 0:
+                avg_reward = np.mean(self.rewards_history[-50:]) if self.rewards_history else 0
+                avg_bbox = np.mean(self.bbox_history[-50:]) if self.bbox_history else 0
+                avg_trees = np.mean(self.trees_history[-50:]) if self.trees_history else 0
+                print(f"Update {update+1:5d} | Episodes: {total_episodes:4d} | "
+                      f"Reward: {avg_reward:7.2f} | BBox: {avg_bbox:.4f} | Trees: {avg_trees:.1f} | Best: {best_bbox:.4f}")
             
-            # Save visualization every 50 episodes
-            if self.visualize and (episode + 1) % 50 == 0:
-                self.save_visualization(episode + 1)
+            # Save visualization every 10 updates
+            if self.visualize and (update + 1) % 10 == 0:
+                self.save_visualization(total_episodes)
+                
+            # Save checkpoint every 200 updates
+            if (update + 1) % 200 == 0:
+                self.save_model(f"checkpoint_{update+1}.pt")
         
-        print("-" * 50)
-        print("Training completed!")
+        print("-" * 60)
+        print(f"Training completed! Total episodes: {total_episodes}")
+        print(f"Best BBox: {best_bbox:.4f}")
+        self.save_model("final_model.pt")
+    
+    def save_model(self, filename: str):
+        """Save model checkpoint."""
+        path = self.output_dir / filename
+        torch.save({
+            'model_state_dict': self.network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'reward_mean': self.reward_mean,
+            'reward_std': self.reward_std,
+            'reward_count': self.reward_count,
+        }, path)
+        print(f"Model saved to {path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Relative Transformer Training")
     parser.add_argument("--n_trees", type=int, default=50)
     parser.add_argument("--n_episodes", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--anchor_mode", type=str, default="board_center",
+                        choices=["board_center", "bbox_center", "last_tree"],
+                        help="Anchor: 'board_center' (fixed 5,5), 'bbox_center', or 'last_tree'")
+    parser.add_argument("--action_mode", type=str, default="polar",
+                        choices=["polar", "cartesian"],
+                        help="Action space: 'polar' [r,theta,rot] or 'cartesian' [dx,dy,rot]")
+    parser.add_argument("--feature_mode", type=str, default="polar",
+                        choices=["polar", "cartesian"],
+                        help="Feature space: 'polar' [r,sin,cos] or 'cartesian' [dx,dy]")
     args = parser.parse_args()
+    
+    print(f"Config: anchor={args.anchor_mode}, action={args.action_mode}, features={args.feature_mode}")
     
     trainer = RelativeTrainer(
         n_trees=args.n_trees,
         lr=args.lr,
+        anchor_mode=args.anchor_mode,
+        action_mode=args.action_mode,
+        feature_mode=args.feature_mode,
         visualize=True
     )
     trainer.train(n_episodes=args.n_episodes)

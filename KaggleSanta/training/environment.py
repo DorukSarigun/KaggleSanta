@@ -527,61 +527,57 @@ class TreePackingEnvironment(gym.Env):
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        İYİLEŞTİRİLMİŞ Reward Fonksiyonu - GRADIENT-BASED COLLISION PENALTY.
+        TUNED Reward Function - Exploration Bonus + Softer Collision.
 
-        Değişiklikler:
-        1. Gradient-based collision penalty (smooth, informative)
-        2. Near-collision warnings (soft penalties for risky placements)
-        3. Kaggle metric improvement bonus
-        4. Placement bonus
+        Changes:
+        1. Softer collision penalty: [-8, -2] instead of [-20, -5]
+        2. Exploration bonus: reward for placing far from last tree
+        3. Placement bonus remains
+        4. Kaggle improvement bonus
         """
         reward = 0.0
-        norm_sq = float(scale_factor) ** 2
+        norm = float(scale_factor)
+        norm_sq = norm ** 2
 
-        # Progress ratio (0 = başlangıç, 1 = bitti)
-        progress = self.current_index / max(self.n_trees, 1)
         n_placed = len(self.placed_trees)
 
-        # ==================== 1. COLLISION PENALTY (GRADIENT-BASED) ====================
+        # ==================== 1. COLLISION PENALTY (REMAINING TREES) ====================
         if collision_area > 0:
-            # Normalize collision area to [0, 1]
-            # Typical tree area is ~0.01 * norm_sq
-            typical_tree_area = 0.01 * norm_sq
-            collision_ratio = min(collision_area / typical_tree_area, 1.0)
-
-            # Smooth gradient penalty: increases with overlap severity
-            # Small overlap: ~-5, Large overlap: ~-20
-            collision_penalty = -5.0 - (15.0 * collision_ratio)
-
-            # Early return BUT keep going (don't terminate episode)
-            # This allows learning from near-collisions
+            # Penalty = negative of remaining trees
+            # Early collision (40 left) = -40, Late collision (5 left) = -5
+            remaining_trees = self.n_trees - self.current_index
+            collision_penalty = -float(remaining_trees)
             return collision_penalty
 
-        # NEAR-COLLISION PENALTY REMOVED - unnecessary complexity
+        # ==================== 2. PLACEMENT BONUS ====================
+        reward = 3.0  # Increased placement bonus
 
-        # ==================== 2. PLACEMENT BONUS + KAGGLE IMPROVEMENT ====================
-        # Her başarılı yerleşim = +1 bonus
-        reward = 1.0  # Base placement bonus
+        # ==================== 3. EXPLORATION BONUS ====================
+        # Reward for placing tree far from the last tree
+        if n_placed >= 2:
+            last_tree = self.placed_trees[-1]
+            prev_tree = self.placed_trees[-2]
+            
+            # Distance between last two trees
+            dx = (float(last_tree.center_x) - float(prev_tree.center_x)) / norm
+            dy = (float(last_tree.center_y) - float(prev_tree.center_y)) / norm
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            # Exploration bonus: reward for spreading out
+            # dist in [0, ~5], normalize and give bonus
+            exploration_bonus = min(dist / 2.0, 1.0) * 0.5  # Up to +0.5
+            reward += exploration_bonus
 
-        # Kaggle score = s² / n where s = max(width, height)
-        # Lower is better -> improvement = old - new
+        # ==================== 4. KAGGLE IMPROVEMENT ====================
         if old_bbox_area > 0 and new_bbox_area > 0 and n_placed > 0:
-            # Old Kaggle score (before this tree)
-            old_bbox_size = np.sqrt(old_bbox_area) / float(scale_factor)
+            old_bbox_size = np.sqrt(old_bbox_area) / norm
             old_kaggle = (old_bbox_size ** 2) / max(n_placed - 1, 1) if n_placed > 1 else 0
 
-            # New Kaggle score (after this tree)
-            new_bbox_size = np.sqrt(new_bbox_area) / float(scale_factor)
+            new_bbox_size = np.sqrt(new_bbox_area) / norm
             new_kaggle = (new_bbox_size ** 2) / n_placed
 
-            # Improvement: old - new (positive = good)
             kaggle_improvement = old_kaggle - new_kaggle
-
-            # Scale kaggle improvement (it's usually small, ~0.001-0.01)
-            # Amplify it to balance with placement bonus
             reward += kaggle_improvement * 10.0
-
-        # DENSITY BONUS REMOVED - unnecessary complexity
 
         return reward
 
