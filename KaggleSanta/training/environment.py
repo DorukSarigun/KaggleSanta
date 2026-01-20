@@ -527,48 +527,65 @@ class TreePackingEnvironment(gym.Env):
     def _calculate_reward(self, old_bbox_area: float, new_bbox_area: float,
                          collision_area: float) -> float:
         """
-        TUNED Reward Function - Exploration Bonus + Softer Collision.
+        ENHANCED Adaptive Reward Function.
 
-        Changes:
-        1. Softer collision penalty: [-8, -2] instead of [-20, -5]
-        2. Exploration bonus: reward for placing far from last tree
-        3. Placement bonus remains
-        4. Kaggle improvement bonus
+        Features:
+        1. Dynamic collision penalty (remaining trees)
+        2. Decaying exploration bonus (early exploration, late compactness)
+        3. Compactness reward (penalize bbox growth)
+        4. Fill ratio bonus (efficient space usage)
+        5. Multi-objective Kaggle score
+        6. Late-stage density bonus
         """
         reward = 0.0
         norm = float(scale_factor)
         norm_sq = norm ** 2
 
         n_placed = len(self.placed_trees)
+        progress = n_placed / self.n_trees  # 0 to 1
 
         # ==================== 1. COLLISION PENALTY (REMAINING TREES) ====================
         if collision_area > 0:
             # Penalty = negative of remaining trees
-            # Early collision (40 left) = -40, Late collision (5 left) = -5
             remaining_trees = self.n_trees - self.current_index
             collision_penalty = -float(remaining_trees)
             return collision_penalty
 
         # ==================== 2. PLACEMENT BONUS ====================
-        reward = 3.0  # Increased placement bonus
+        reward = 3.0
 
-        # ==================== 3. EXPLORATION BONUS ====================
-        # Reward for placing tree far from the last tree
+        # ==================== 3. ADAPTIVE EXPLORATION BONUS (DECAYING) ====================
+        # Early stage: encourage exploration
+        # Late stage: encourage compactness
         if n_placed >= 2:
             last_tree = self.placed_trees[-1]
             prev_tree = self.placed_trees[-2]
-            
-            # Distance between last two trees
+
             dx = (float(last_tree.center_x) - float(prev_tree.center_x)) / norm
             dy = (float(last_tree.center_y) - float(prev_tree.center_y)) / norm
             dist = np.sqrt(dx**2 + dy**2)
-            
-            # Exploration bonus: reward for spreading out
-            # dist in [0, ~5], normalize and give bonus
-            exploration_bonus = min(dist / 2.0, 1.0) * 0.5  # Up to +0.5
+
+            # Decaying weight: 1.0 at start -> 0.0 at 70% progress
+            exploration_weight = max(0.0, 1.0 - progress / 0.7)
+            exploration_bonus = min(dist / 3.0, 1.0) * 0.3 * exploration_weight
             reward += exploration_bonus
 
-        # ==================== 4. KAGGLE IMPROVEMENT ====================
+        # ==================== 4. COMPACTNESS REWARD (PENALIZE BBOX GROWTH) ====================
+        if old_bbox_area > 0 and new_bbox_area > old_bbox_area:
+            growth_ratio = (new_bbox_area - old_bbox_area) / old_bbox_area
+            # Stronger penalty in late stage
+            compactness_weight = 1.0 + progress  # 1.0 -> 2.0
+            compactness_penalty = growth_ratio * 2.0 * compactness_weight
+            reward -= compactness_penalty
+
+        # ==================== 5. FILL RATIO BONUS (EFFICIENT SPACE USAGE) ====================
+        if n_placed > 0:
+            fill_ratio = self.fill_ratio
+            # Bonus scales with progress (more important later)
+            fill_bonus = fill_ratio * 3.0 * (1.0 + progress)
+            reward += fill_bonus
+
+        # ==================== 6. KAGGLE IMPROVEMENT ====================
         if old_bbox_area > 0 and new_bbox_area > 0 and n_placed > 0:
             old_bbox_size = np.sqrt(old_bbox_area) / norm
             old_kaggle = (old_bbox_size ** 2) / max(n_placed - 1, 1) if n_placed > 1 else 0
@@ -578,6 +595,21 @@ class TreePackingEnvironment(gym.Env):
 
             kaggle_improvement = old_kaggle - new_kaggle
             reward += kaggle_improvement * 10.0
+
+        # ==================== 7. LATE-STAGE DENSITY BONUS ====================
+        # Encourage tight packing near the end
+        if progress > 0.7 and n_placed >= 2:
+            last_tree = self.placed_trees[-1]
+            # Count nearby trees (within distance 1.0)
+            nearby_count = 0
+            for other in self.placed_trees[:-1]:
+                dist = last_tree.polygon.distance(other.polygon) / norm
+                if dist < 1.0:
+                    nearby_count += 1
+
+            # Density bonus: more neighbors = higher reward
+            density_bonus = min(nearby_count / 5.0, 1.0) * 2.0
+            reward += density_bonus
 
         return reward
 
